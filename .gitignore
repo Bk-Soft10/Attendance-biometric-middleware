@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Runtime
+*.log
+
+# Local secrets — copy config.ini and fill in your real API key locally.
+# Commit only the template if you must; never commit a real api_key.
+config.local.ini
