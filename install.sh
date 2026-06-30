@@ -53,33 +53,50 @@ ask() {
     fi
 }
 
+# Read a value from an INI file: ini_value FILE KEY
+ini_value() {
+    sed -n -E "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*(.*)$/\1/p" "$1" 2>/dev/null | head -n1
+}
+
 echo "============================================================"
 c_green " Biometric Attendance Bridge - Installer"
 echo "============================================================"
 
+# If a config.ini sits next to this installer (e.g. you cloned the repo and
+# edited it to add your API key/URL), it is used as-is — no questions asked.
+EXISTING_CONFIG="$SCRIPT_DIR/config.ini"
+USE_EXISTING=0
+if [ -f "$EXISTING_CONFIG" ]; then
+    USE_EXISTING=1
+    c_green "Found config.ini next to the installer — using it as-is:"
+    echo "  $EXISTING_CONFIG"
+fi
+
 # ----- Gather settings ---------------------------------------------------
 if [ "$NONINTERACTIVE" != "1" ]; then
     INSTALL_DIR="$(ask 'Install directory' "$INSTALL_DIR")"
-    ODOO_URL="$(ask 'Odoo URL (https://company.odoo.com)' "$ODOO_URL")"
-    ODOO_DB="$(ask 'Odoo database name (blank if single-DB host)' "$ODOO_DB")"
-    TRANSPORT="$(ask 'Transport (json2/custom)' "$TRANSPORT")"
-    if [ "$TRANSPORT" = "json2" ]; then
-        echo "  -> Provide a USER API key (Odoo: Preferences > Account Security > New API Key)"
-    else
-        echo "  -> Provide a device API key (Odoo: Biometric > Devices > device form)"
+    if [ "$USE_EXISTING" != "1" ]; then
+        ODOO_URL="$(ask 'Odoo URL (https://company.odoo.com)' "$ODOO_URL")"
+        ODOO_DB="$(ask 'Odoo database name (blank if single-DB host)' "$ODOO_DB")"
+        TRANSPORT="$(ask 'Transport (json2/custom)' "$TRANSPORT")"
+        if [ "$TRANSPORT" = "json2" ]; then
+            echo "  -> Provide a USER API key (Odoo: Preferences > Account Security > New API Key)"
+        else
+            echo "  -> Provide a device API key (Odoo: Biometric > Devices > device form)"
+        fi
+        API_KEY="$(ask 'API key' "$API_KEY")"
+        AUTO_DISCOVER="$(ask 'Auto-discover all devices from Odoo? (true/false)' "$AUTO_DISCOVER")"
+        if [ "$AUTO_DISCOVER" != "true" ]; then
+            DEVICE_CODE="$(ask 'Device code (single-device mode)' "$DEVICE_CODE")"
+            DEVICE_HOST="$(ask 'Device IP (single-device mode)' "$DEVICE_HOST")"
+            DEVICE_PORT="$(ask 'Device port' "$DEVICE_PORT")"
+        fi
+        INTERVAL="$(ask 'Sync interval (minutes)' "$INTERVAL")"
     fi
-    API_KEY="$(ask 'API key' "$API_KEY")"
-    AUTO_DISCOVER="$(ask 'Auto-discover all devices from Odoo? (true/false)' "$AUTO_DISCOVER")"
-    if [ "$AUTO_DISCOVER" != "true" ]; then
-        DEVICE_CODE="$(ask 'Device code (single-device mode)' "$DEVICE_CODE")"
-        DEVICE_HOST="$(ask 'Device IP (single-device mode)' "$DEVICE_HOST")"
-        DEVICE_PORT="$(ask 'Device port' "$DEVICE_PORT")"
-    fi
-    INTERVAL="$(ask 'Sync interval (minutes)' "$INTERVAL")"
     SERVICE_USER="$(ask 'Run service as user' "$SERVICE_USER")"
 fi
 
-if [ -z "$ODOO_URL" ] || [ -z "$API_KEY" ]; then
+if [ "$USE_EXISTING" != "1" ] && { [ -z "$ODOO_URL" ] || [ -z "$API_KEY" ]; }; then
     c_red "ERROR: Odoo URL and API key are required."
     exit 1
 fi
@@ -104,10 +121,22 @@ c_yellow "Installing dependencies (pyzk, requests)..."
 "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" >/dev/null \
     || "$INSTALL_DIR/venv/bin/pip" install pyzk requests >/dev/null
 
-# ----- Write config.ini --------------------------------------------------
+# ----- Configuration -----------------------------------------------------
 CONFIG_FILE="$INSTALL_DIR/config.ini"
-c_yellow "Writing configuration: $CONFIG_FILE"
-cat > "$CONFIG_FILE" <<EOF
+LOG_FILE="${LOG_FILE:-${INSTALL_DIR}/${APP_NAME}.log}"
+
+if [ "$USE_EXISTING" = "1" ]; then
+    c_yellow "Installing your configuration: $CONFIG_FILE"
+    cp "$EXISTING_CONFIG" "$CONFIG_FILE"
+    CFG_URL="$(ini_value "$CONFIG_FILE" url)"
+    CFG_KEY="$(ini_value "$CONFIG_FILE" api_key)"
+    if [ -z "$CFG_URL" ] || [ -z "$CFG_KEY" ] || [ "$CFG_KEY" = "REPLACE_WITH_YOUR_API_KEY" ]; then
+        c_red "ERROR: edit $EXISTING_CONFIG and set a real 'url' and 'api_key' before installing."
+        exit 1
+    fi
+else
+    c_yellow "Writing configuration: $CONFIG_FILE"
+    cat > "$CONFIG_FILE" <<EOF
 [odoo]
 url = ${ODOO_URL}
 db = ${ODOO_DB}
@@ -135,7 +164,24 @@ retry_delay_seconds = 10
 level = INFO
 file =
 EOF
+fi
+
+# Ensure a persistent log file: if [logging] file is empty, point it at LOG_FILE;
+# otherwise honour whatever path is already configured.
+if grep -qE '^[[:space:]]*file[[:space:]]*=[[:space:]]*$' "$CONFIG_FILE"; then
+    sed -i -E "s|^([[:space:]]*file[[:space:]]*=).*$|\1 ${LOG_FILE}|" "$CONFIG_FILE"
+else
+    CFG_LOG="$(ini_value "$CONFIG_FILE" file)"
+    [ -n "$CFG_LOG" ] && LOG_FILE="$CFG_LOG"
+fi
+
+# Make config readable and log file writable by the service user (the daemon
+# runs as SERVICE_USER, not root).
 chmod 600 "$CONFIG_FILE"
+chown "$SERVICE_USER" "$CONFIG_FILE" 2>/dev/null || true
+touch "$LOG_FILE" 2>/dev/null || true
+chown "$SERVICE_USER" "$LOG_FILE" 2>/dev/null || true
+c_yellow "Log file: $LOG_FILE"
 
 # ----- Optional test run -------------------------------------------------
 RUN_TEST="$(ask 'Run a test sync now? (yes/no)' 'no')"
@@ -174,7 +220,8 @@ EOF
     echo
     echo "Manage it with:"
     echo "  systemctl status ${APP_NAME}"
-    echo "  journalctl -u ${APP_NAME} -f"
+    echo "  journalctl -u ${APP_NAME} -f          # live service output"
+    echo "  tail -f ${LOG_FILE}   # persistent log file"
     echo "  systemctl restart ${APP_NAME}"
 else
     c_yellow "Skipping systemd service (not available or disabled)."
@@ -183,4 +230,6 @@ else
 fi
 
 echo
-c_green "Done. Configuration: ${CONFIG_FILE}"
+c_green "Done."
+echo "  Configuration: ${CONFIG_FILE}"
+echo "  Log file:      ${LOG_FILE}"

@@ -525,6 +525,35 @@ class BiometricDevice:
             return False
 
 
+def apply_logging(log_conf: Dict, verbose: bool = False):
+    """Apply the configured log level and (optionally) a rotating-free file sink.
+
+    Console output is always available (stdout / journald under systemd). When
+    ``[logging] file`` is set, a file handler is added so the bridge also keeps
+    a persistent log on disk for later inspection.
+    """
+    log_conf = log_conf or {}
+    level_name = str(log_conf.get('level', 'INFO')).upper()
+    level = logging.DEBUG if verbose else getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
+
+    log_file = (log_conf.get('file') or '').strip()
+    if not log_file:
+        return
+    target = os.path.abspath(log_file)
+    # Avoid stacking duplicate handlers on the same file (e.g. daemon restarts).
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == target:
+            return
+    try:
+        fh = logging.FileHandler(target)
+        fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        logger.addHandler(fh)
+        logger.info("Logging to file: %s", target)
+    except OSError as e:
+        logger.warning("Could not open log file %s: %s", target, e)
+
+
 def load_config(config_path: str) -> Dict:
     """Load configuration from INI file"""
     config = configparser.ConfigParser()
@@ -813,10 +842,6 @@ Examples:
         create_sample_config(args.create_config)
         return
     
-    # Setup verbose logging
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    
     # Load configuration
     if args.config:
         if not os.path.exists(args.config):
@@ -866,6 +891,9 @@ Examples:
             }
         }
     
+    # Configure logging (level + optional file sink) now that config is known.
+    apply_logging(config.get('logging'), args.verbose)
+
     # Validate configuration
     odoo_config = config['odoo']
     if not odoo_config['url'] or not odoo_config['api_key']:

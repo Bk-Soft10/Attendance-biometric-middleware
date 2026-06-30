@@ -75,11 +75,19 @@ cd Attendance-biometric-middleware
 
 ### Linux (systemd service)
 
+The simplest flow — edit `config.ini` first, then let the installer use it:
+
 ```bash
+nano config.ini          # set api_key (url + db are pre-filled)
 sudo bash install.sh
 ```
 
-Interactive prompts pre-fill from `config.ini`. For unattended provisioning:
+When a `config.ini` sits next to `install.sh`, the installer **uses it as-is**
+(no questions asked) — it just refuses to continue if `api_key` is still the
+`REPLACE_WITH_YOUR_API_KEY` placeholder. If no `config.ini` is present, the
+installer falls back to interactive prompts.
+
+For fully unattended provisioning without editing the file first:
 
 ```bash
 sudo NONINTERACTIVE=1 \
@@ -93,8 +101,9 @@ sudo NONINTERACTIVE=1 \
 ```
 
 The installer creates a virtualenv at `/opt/biometric-bridge/venv`, installs
-`pyzk` + `requests`, writes `/opt/biometric-bridge/config.ini`, and registers a
-systemd service.
+`pyzk` + `requests`, installs the config to `/opt/biometric-bridge/config.ini`,
+provisions a persistent log file at `/opt/biometric-bridge/biometric-bridge.log`
+(owned by the service user), and registers a systemd service.
 
 ### Windows (Scheduled Task)
 
@@ -143,8 +152,12 @@ retry_delay_seconds = 10
 
 [logging]
 level = INFO
-file =
+file =                               ; installer auto-fills this with the log path
 ```
+
+> **Log file:** leave `file =` blank and the installer points it at
+> `/opt/biometric-bridge/biometric-bridge.log`. Set an explicit path to override.
+> When `file` is set, the bridge writes to it **and** to the console/journald.
 
 > **Why `db` matters here:** `www.samtia.com` hosts more than one Odoo database,
 > so the bridge must name `adv-photonix-main-23293882` on every request. On a
@@ -181,7 +194,8 @@ concurrency guarantee.
 ```bash
 sudo systemctl enable --now biometric-bridge
 sudo systemctl status biometric-bridge
-sudo journalctl -u biometric-bridge -f     # live logs
+sudo journalctl -u biometric-bridge -f             # live service output
+tail -f /opt/biometric-bridge/biometric-bridge.log # persistent log file
 ```
 
 **Windows:**

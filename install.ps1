@@ -41,31 +41,49 @@ function Ask($prompt, $default) {
     return Read-Host $prompt
 }
 
+function Get-IniValue($file, $key) {
+    if (-not (Test-Path $file)) { return "" }
+    $line = Select-String -Path $file -Pattern "^\s*$key\s*=\s*(.*)$" | Select-Object -First 1
+    if ($line) { return $line.Matches[0].Groups[1].Value.Trim() }
+    return ""
+}
+
 Write-Host "============================================================" -ForegroundColor Green
 Write-Host " Biometric Attendance Bridge - Windows Installer" -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Green
 
-if (-not $NonInteractive) {
-    $InstallDir = Ask "Install directory" $InstallDir
-    $OdooUrl    = Ask "Odoo URL (https://company.odoo.com)" $OdooUrl
-    $OdooDb     = Ask "Odoo database name (blank if single-DB host)" $OdooDb
-    $Transport  = Ask "Transport (json2/custom)" $Transport
-    if ($Transport -eq "json2") {
-        Write-Host "  -> Provide a USER API key (Preferences > Account Security > New API Key)"
-    } else {
-        Write-Host "  -> Provide a device API key (Biometric > Devices > device form)"
-    }
-    $ApiKey       = Ask "API key" $ApiKey
-    $AutoDiscover = Ask "Auto-discover all devices from Odoo? (true/false)" $AutoDiscover
-    if ($AutoDiscover -ne "true") {
-        $DeviceCode = Ask "Device code (single-device mode)" $DeviceCode
-        $DeviceHost = Ask "Device IP (single-device mode)" $DeviceHost
-        $DevicePort = [int](Ask "Device port" $DevicePort)
-    }
-    $Interval = [int](Ask "Sync interval (minutes)" $Interval)
+# If a config.ini sits next to this installer (e.g. you cloned the repo and
+# edited it to add your API key/URL), it is used as-is — no questions asked.
+$ExistingConfig = Join-Path $ScriptDir "config.ini"
+$UseExisting = Test-Path $ExistingConfig
+if ($UseExisting) {
+    Write-Host "Found config.ini next to the installer - using it as-is:" -ForegroundColor Green
+    Write-Host "  $ExistingConfig"
 }
 
-if ([string]::IsNullOrWhiteSpace($OdooUrl) -or [string]::IsNullOrWhiteSpace($ApiKey)) {
+if (-not $NonInteractive) {
+    $InstallDir = Ask "Install directory" $InstallDir
+    if (-not $UseExisting) {
+        $OdooUrl    = Ask "Odoo URL (https://company.odoo.com)" $OdooUrl
+        $OdooDb     = Ask "Odoo database name (blank if single-DB host)" $OdooDb
+        $Transport  = Ask "Transport (json2/custom)" $Transport
+        if ($Transport -eq "json2") {
+            Write-Host "  -> Provide a USER API key (Preferences > Account Security > New API Key)"
+        } else {
+            Write-Host "  -> Provide a device API key (Biometric > Devices > device form)"
+        }
+        $ApiKey       = Ask "API key" $ApiKey
+        $AutoDiscover = Ask "Auto-discover all devices from Odoo? (true/false)" $AutoDiscover
+        if ($AutoDiscover -ne "true") {
+            $DeviceCode = Ask "Device code (single-device mode)" $DeviceCode
+            $DeviceHost = Ask "Device IP (single-device mode)" $DeviceHost
+            $DevicePort = [int](Ask "Device port" $DevicePort)
+        }
+        $Interval = [int](Ask "Sync interval (minutes)" $Interval)
+    }
+}
+
+if (-not $UseExisting -and ([string]::IsNullOrWhiteSpace($OdooUrl) -or [string]::IsNullOrWhiteSpace($ApiKey))) {
     Write-Host "ERROR: Odoo URL and API key are required." -ForegroundColor Red
     exit 1
 }
@@ -89,9 +107,20 @@ $VenvPy = Join-Path $InstallDir "venv\Scripts\python.exe"
 Write-Host "Installing dependencies (pyzk, requests)..." -ForegroundColor Yellow
 & $VenvPy -m pip install pyzk requests | Out-Null
 
-# Write config.ini
+# Configuration
 $ConfigFile = Join-Path $InstallDir "config.ini"
-Write-Host "Writing configuration: $ConfigFile" -ForegroundColor Yellow
+$LogFile = Join-Path $InstallDir "biometric-bridge.log"
+if ($UseExisting) {
+    Write-Host "Installing your configuration: $ConfigFile" -ForegroundColor Yellow
+    Copy-Item -Force $ExistingConfig $ConfigFile
+    $cfgUrl = Get-IniValue $ConfigFile "url"
+    $cfgKey = Get-IniValue $ConfigFile "api_key"
+    if ([string]::IsNullOrWhiteSpace($cfgUrl) -or [string]::IsNullOrWhiteSpace($cfgKey) -or $cfgKey -eq "REPLACE_WITH_YOUR_API_KEY") {
+        Write-Host "ERROR: edit $ExistingConfig and set a real 'url' and 'api_key' before installing." -ForegroundColor Red
+        exit 1
+    }
+} else {
+    Write-Host "Writing configuration: $ConfigFile" -ForegroundColor Yellow
 @"
 [odoo]
 url = $OdooUrl
@@ -120,6 +149,17 @@ retry_delay_seconds = 10
 level = INFO
 file =
 "@ | Set-Content -Encoding ASCII $ConfigFile
+}
+
+# Ensure a persistent log file: if [logging] file is empty, point it at $LogFile;
+# otherwise honour whatever path is already configured.
+$cfgLog = Get-IniValue $ConfigFile "file"
+if ([string]::IsNullOrWhiteSpace($cfgLog)) {
+    (Get-Content $ConfigFile) -replace '^\s*file\s*=\s*$', "file = $LogFile" | Set-Content -Encoding ASCII $ConfigFile
+} else {
+    $LogFile = $cfgLog
+}
+Write-Host "Log file: $LogFile" -ForegroundColor Yellow
 
 # Optional test run
 if (-not $NonInteractive) {
@@ -150,4 +190,6 @@ if (-not $NoService) {
 }
 
 Write-Host ""
-Write-Host "Done. Configuration: $ConfigFile" -ForegroundColor Green
+Write-Host "Done." -ForegroundColor Green
+Write-Host "  Configuration: $ConfigFile"
+Write-Host "  Log file:      $LogFile"
