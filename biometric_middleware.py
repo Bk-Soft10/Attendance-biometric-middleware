@@ -78,15 +78,61 @@ UNDEFINED_PUNCH = '255'
 
 
 def map_punch(value) -> str:
-    """Map a raw device punch/status value to our strict enum.
+    """Map a raw device punch value to our strict enum.
 
+  In pyzk ``Attendance.punch`` is the check-in/out type:
     ``'0'``=Check In, ``'1'``=Check Out, ``'2'``=Break Out, ``'3'``=Break In,
-    ``'4'``=Overtime In, ``'5'``=Overtime Out. Anything unexpected is mapped to
-    ``'255'`` (Undefined) so it is still stored but never silently
-    mis-classified as a real check-in/out.
+    ``'4'``=Overtime In, ``'5'``=Overtime Out.
+
+  ``Attendance.status`` is the *verification mode* (fingerprint, card, …) —
+  never pass that here. Anything unexpected maps to ``'255'`` (Undefined).
     """
     token = str(value).strip() if value is not None else ''
     return token if token in VALID_PUNCH_TYPES else UNDEFINED_PUNCH
+
+
+# ZKTeco verify mode (pyzk Attendance.status / iclock ATTLOG column 4)
+# -> Odoo auth_type. Mirrors controllers/iclock_api.py.
+_VERIFY_AUTH_MAP = {
+    '0': 'password',
+    '1': 'fingerprint',
+    '2': 'fingerprint',  # PIN
+    '3': 'rfid',
+    '4': 'rfid',
+    '15': 'face',
+}
+
+
+def map_auth_type(verify_mode) -> str:
+    """Map pyzk ``Attendance.status`` (verify mode) to Odoo ``auth_type``."""
+    token = str(verify_mode).strip() if verify_mode is not None else '1'
+    return _VERIFY_AUTH_MAP.get(token, 'fingerprint')
+
+
+def map_verify_mode(verify_mode) -> str:
+    """Map pyzk ``Attendance.status`` to Odoo ``verify_mode`` selection."""
+    token = str(verify_mode).strip() if verify_mode is not None else '1'
+    return token if token in {str(i) for i in range(11)} else '1'
+
+
+def attendance_record_to_log(record, tz_name: Optional[str]) -> Dict:
+    """Convert a pyzk ``Attendance`` row to our outbound log dict.
+
+    pyzk field semantics (do NOT swap):
+      - ``record.punch``  → attendance state (check-in/out, 0-5)
+      - ``record.status`` → verification mode (fingerprint/card/face, …)
+    """
+    raw_punch = getattr(record, 'punch', None)
+    raw_status = getattr(record, 'status', None)
+    return {
+        'pin': str(record.user_id),
+        'timestamp': to_utc_iso(record.timestamp, tz_name),
+        'punch': map_punch(raw_punch),
+        'auth_type': map_auth_type(raw_status),
+        'verify_mode': map_verify_mode(raw_status),
+        'raw_punch': raw_punch,
+        'raw_status': raw_status,
+    }
 
 
 def _get_zone(tz_name: Optional[str]):
@@ -416,31 +462,63 @@ class BiometricDevice:
         self.zk = None
     
     def connect(self) -> bool:
-        """Connect to the biometric device"""
+        """Connect to the biometric device."""
         if not PYZK_AVAILABLE:
             logger.error("pyzk library not available. Cannot connect to device.")
             return False
-        
-        try:
-            self.zk = ZK(
-                self.host,
-                port=self.port,
-                timeout=self.timeout,
-                password=self.password,
-                force_udp=False,
-                ommit_ping=False
+
+        # BIOSENSE-T screens often show port 2000 as the ADMS *server* listen
+        # port — pyzk polls the ZK SDK port (4370 by default). Try both.
+        ports_to_try = [self.port]
+        if self.port != 4370:
+            ports_to_try.append(4370)
+
+        last_error = None
+        for port in ports_to_try:
+            try:
+                self.zk = ZK(
+                    self.host,
+                    port=port,
+                    timeout=self.timeout,
+                    password=self.password,
+                    force_udp=False,
+                    ommit_ping=False,
+                )
+                self.conn = self.zk.connect()
+                if port != self.port:
+                    logger.warning(
+                        "Connected to %s on port %s (configured port %s failed). "
+                        "Update device_port in Odoo if %s is the permanent port.",
+                        self.host, port, self.port, port,
+                    )
+                self.port = port
+                logger.info("Connected to device at %s:%s", self.host, self.port)
+
+                device_info = self.get_device_info()
+                logger.info("Device: %s", json.dumps(device_info, indent=2, default=str))
+                return True
+            except Exception as e:
+                last_error = e
+                if port != ports_to_try[-1]:
+                    logger.warning(
+                        "Connection attempt %s:%s failed (%s); trying next port...",
+                        self.host, port, e,
+                    )
+                else:
+                    logger.error(
+                        "Failed to connect to %s:%s - %s",
+                        self.host, port, e,
+                    )
+
+        if self.device_type == 'biosense_t':
+            logger.error(
+                "BIOSENSE-T at %s did not respond on ports %s. "
+                "Port 2000 is usually the ADMS server port, not the ZK SDK port. "
+                "If polling fails, configure the device for ADMS push to Odoo "
+                "(/iclock/cdata) and set connection_mode=adms on the device record.",
+                self.host, ports_to_try,
             )
-            self.conn = self.zk.connect()
-            logger.info("Connected to device at %s:%s", self.host, self.port)
-            
-            # Log device info
-            device_info = self.get_device_info()
-            logger.info("Device: %s", json.dumps(device_info, indent=2, default=str))
-            return True
-            
-        except Exception as e:
-            logger.error("Failed to connect to %s:%s - %s", self.host, self.port, str(e))
-            return False
+        return False
     
     def disconnect(self):
         """Disconnect from device"""
@@ -494,16 +572,14 @@ class BiometricDevice:
                     skipped += 1
                     continue
 
-                logs.append({
-                    'pin': str(record.user_id),
-                    # Convert the naive device-local stamp to UTC using the
-                    # device's own timezone *before* transmission.
-                    'timestamp': to_utc_iso(record.timestamp, self.tz_name),
-                    # Map the raw device status to our strict punch enum
-                    # (unexpected values become '255' / Undefined).
-                    'punch': map_punch(getattr(record, 'status', None)),
-                    'auth_type': str(record.punch),
-                })
+                entry = attendance_record_to_log(record, self.tz_name)
+                if logger.isEnabledFor(logging.DEBUG) and len(logs) < 5:
+                    logger.debug(
+                        "Raw attendance: pin=%s raw_punch=%s raw_status=%s -> punch=%s auth=%s",
+                        entry['pin'], entry['raw_punch'], entry['raw_status'],
+                        entry['punch'], entry['auth_type'],
+                    )
+                logs.append(entry)
             
             logger.info("Retrieved %s logs (%s skipped)", len(logs), skipped)
             return logs

@@ -29,7 +29,7 @@ deployments where the server cannot reach the devices directly.
 | Device | Model | IP : Port | Serial | Timezone |
 |--------|-------|-----------|--------|----------|
 | Main Gate | iWEB / ZKTeco **F18** | `192.168.2.12 : 4370` | `BAY5235001172` | `Asia/Riyadh` |
-| Back Door | **BIOSENSE-T(EM)** | `192.168.2.49 : 2000` | `044ff5` (MAC `00:0e:e3:04:4f:f5`) | `Asia/Riyadh` |
+| Back Door | **BIOSENSE-T(EM)** | `192.168.2.49 : 4370` | `044ff5` (MAC `00:0e:e3:04:4f:f5`) | `Asia/Riyadh` |
 
 > Both devices already exist in Odoo under **Attendances → Biometric → Devices**
 > after the module is installed. You only need to add **Employee Mappings**
@@ -44,7 +44,7 @@ deployments where the server cannot reach the devices directly.
 |  - ThreadPoolExecutor (parallel)|        /push_attendance       |  biometric       |
 |  - pyzk over LAN                |                               +------------------+
 +---------------------------------+
-        |  TCP 4370 / 2000 (LAN)
+        |  TCP 4370 (ZK SDK, LAN)
         v
   [F18 192.168.2.12]   [BIOSENSE-T 192.168.2.49]
 ```
@@ -181,7 +181,7 @@ A healthy run shows:
 - `Using Odoo 19 JSON-2 transport (/json/2)` then `JSON-2 API reachable`
 - `Auto-discovering devices from Odoo...` → `Discovered 2 device(s) to sync (parallel)`
 - Interleaved `=== Syncing device: Main Gate - iWEB F18 (192.168.2.12:4370) ===`
-  and `=== Syncing device: Back Door - BIOSENSE-T (192.168.2.49:2000) ===`
+  and `=== Syncing device: Back Door - BIOSENSE-T (192.168.2.49:4370) ===`
 - `Retrieved N logs` and `Device ...: N sent, 0 failed` per device
 
 If one device is unplugged you'll see `Failed to connect to ...` for **that

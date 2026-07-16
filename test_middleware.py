@@ -159,6 +159,36 @@ class TestPunchMapping(unittest.TestCase):
         for v in ('6', '99', 'x', '', None, '-1'):
             self.assertEqual(bm.map_punch(v), '255')
 
+    def test_status_is_verify_mode_not_punch(self):
+        """Fingerprint verify mode (status=1) must NOT become Check Out."""
+        self.assertEqual(bm.map_auth_type(1), 'fingerprint')
+        self.assertEqual(bm.map_punch(0), '0')   # punch=0 → Check In
+        self.assertEqual(bm.map_punch(1), '1')   # punch=1 → Check Out
+
+
+class TestAttendanceRecordMapping(unittest.TestCase):
+    def test_pyzk_fields_not_swapped(self):
+        record = mock.Mock()
+        record.user_id = '178'
+        record.timestamp = bm.datetime(2026, 7, 16, 8, 0, 0)
+        record.punch = 0          # Check In
+        record.status = 1         # Fingerprint verify
+        entry = bm.attendance_record_to_log(record, 'Asia/Riyadh')
+        self.assertEqual(entry['punch'], '0')
+        self.assertEqual(entry['auth_type'], 'fingerprint')
+        self.assertEqual(entry['raw_punch'], 0)
+        self.assertEqual(entry['raw_status'], 1)
+
+    def test_check_out_with_rfid_verify(self):
+        record = mock.Mock()
+        record.user_id = '176'
+        record.timestamp = bm.datetime(2026, 7, 15, 17, 58, 40)
+        record.punch = 1          # Check Out
+        record.status = 3         # RFID verify (was wrongly mapped as Break In)
+        entry = bm.attendance_record_to_log(record, 'Asia/Riyadh')
+        self.assertEqual(entry['punch'], '1')
+        self.assertEqual(entry['auth_type'], 'rfid')
+
 
 class TestTimezoneConversion(unittest.TestCase):
     def test_naive_local_converted_to_utc(self):
