@@ -208,6 +208,64 @@ class TestTimezoneConversion(unittest.TestCase):
         self.assertTrue(out.startswith('2025-01-15T08:00:00'))
 
 
+class TestBiosenseWebParsing(unittest.TestCase):
+    SAMPLE_HTML = """
+    <html><body><h1>Access Log</h1>
+    <table>
+      <tr><th>No.</th><th>User ID</th><th>User Name</th><th>Date</th>
+          <th>Time</th><th>IN/OUT</th><th>Note</th></tr>
+      <tr><td>1</td><td>176(1)</td><td>Ali</td><td>07/16/2026</td>
+          <td>08:20:00</td><td>IN</td><td>Fingerprint</td></tr>
+      <tr><td>2</td><td>176(1)</td><td>Ali</td><td>07/16/2026</td>
+          <td>17:45:11</td><td>OUT</td><td>Card</td></tr>
+      <tr><td>3</td><td>100</td><td></td><td>07/15/2026</td>
+          <td>09:01</td><td>IN</td><td></td></tr>
+    </table>
+    </body></html>
+    """
+
+    def test_parse_html_maps_in_out_to_punch(self):
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        rows = client._parse_access_log_html(self.SAMPLE_HTML)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]['pin'], '176')
+        self.assertEqual(rows[0]['direction'], 'IN')
+        self.assertEqual(rows[1]['direction'], 'OUT')
+        self.assertEqual(rows[0]['timestamp'].hour, 8)
+
+    def test_get_attendance_logs_converts_to_utc_and_punch(self):
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        client._logged_in = True
+        with mock.patch.object(client, '_fetch_access_log_html',
+                               return_value=self.SAMPLE_HTML):
+            logs = client.get_attendance_logs(since=None)
+        self.assertEqual(len(logs), 3)
+        self.assertEqual(logs[0]['punch'], '0')   # IN → Check In
+        self.assertEqual(logs[1]['punch'], '1')   # OUT → Check Out
+        self.assertEqual(logs[1]['auth_type'], 'rfid')
+        self.assertIn('+00:00', logs[0]['timestamp'])
+        # 08:20 Riyadh = 05:20 UTC
+        self.assertTrue(logs[0]['timestamp'].startswith('2026-07-16T05:20:00'))
+
+    def test_stale_port_redirect_in_sync(self):
+        """device_port 2000/4370 must fall back to HTTP 80 for BIOSENSE."""
+        odoo = mock.Mock()
+        odoo.send_batch.return_value = {'ok': True, 'sent': 1, 'failed': 0, 'message': ''}
+        fake = mock.Mock()
+        fake.connect.return_value = True
+        fake.get_attendance_logs.return_value = [
+            {'pin': '1', 'timestamp': '2026-07-16T05:00:00+00:00', 'punch': '0'}]
+        with mock.patch.object(bm, 'BiosenseWebClient', return_value=fake) as Ctor:
+            ok = bm.sync_device(
+                {'name': 'Back', 'host': '192.168.2.49', 'port': 2000,
+                 'device_type': 'biosense_t', 'device_code': 'DEVX',
+                 'timezone': 'Asia/Riyadh'},
+                odoo, {'batch_size': 100, 'retry_attempts': 1, 'since_hours': 24},
+            )
+        self.assertTrue(ok)
+        self.assertEqual(Ctor.call_args.kwargs['port'], 80)
+
+
 class TestConfig(unittest.TestCase):
     def test_sample_config_roundtrip(self):
         import tempfile, os

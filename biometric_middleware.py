@@ -30,6 +30,7 @@ import configparser
 import json
 import logging
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -434,6 +435,413 @@ class OdooJson2Client:
             return {'ok': False, 'sent': 0, 'failed': len(logs), 'message': str(e)}
 
 
+class BiosenseWebClient:
+    """Pull attendance from a Chiyu BIOSENSE-T / WebPass-family device via HTTP.
+
+    These devices do **not** speak the ZKTeco SDK (pyzk / port 4370). Port 2000
+    on the Terminal Status screen is the SoMac *software* listen port (device
+    pushes TO software). Our bridge instead polls the built-in web UI:
+
+      http://<device_ip>/  → login (default admin/admin) → Access Log
+
+    Access Log columns: User ID | Date | Time | IN/OUT
+    IN  → punch '0' (Check In)
+    OUT → punch '1' (Check Out)
+    """
+
+    # Candidate paths used by Chiyu firmware generations (2015+).
+    _LOGIN_PATHS = ('/', '/index.htm', '/index.html', '/login.htm', '/Login.htm')
+    _LOG_PATHS = (
+        '/AccessLog.htm', '/accesslog.htm', '/AccLog.htm', '/acclog.htm',
+        '/log.htm', '/Log.htm', '/AccessLog.html', '/cgi-bin/AccessLog',
+    )
+
+    def __init__(self, host: str, port: int = 80, username: str = 'admin',
+                 password: str = 'admin', timeout: int = 15,
+                 tz_name: str = 'UTC'):
+        self.host = host
+        self.port = int(port or 80)
+        self.username = username or 'admin'
+        self.password = password or 'admin'
+        self.timeout = timeout
+        self.tz_name = tz_name or 'UTC'
+        self.base_url = 'http://%s:%s' % (self.host, self.port)
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'BiometricBridge/1.0 (BIOSENSE)',
+            'Accept': 'text/html,application/xhtml+xml,*/*',
+        })
+        self._logged_in = False
+
+    def connect(self) -> bool:
+        """Reach the device web UI and authenticate."""
+        try:
+            # Probe reachability first.
+            probe = self.session.get(self.base_url + '/', timeout=self.timeout)
+            logger.info(
+                "BIOSENSE web UI reachable at %s (HTTP %s)",
+                self.base_url, probe.status_code,
+            )
+        except Exception as e:
+            logger.error(
+                "Cannot reach BIOSENSE web UI at %s: %s "
+                "(check LAN, ping, and that Web Management Port is open)",
+                self.base_url, e,
+            )
+            return False
+
+        if self._try_login():
+            self._logged_in = True
+            return True
+
+        logger.error(
+            "BIOSENSE login failed at %s with user '%s'. "
+            "Verify web_username / web_password on the device record "
+            "(device defaults are usually admin/admin).",
+            self.base_url, self.username,
+        )
+        return False
+
+    def disconnect(self):
+        self._logged_in = False
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+    def _try_login(self) -> bool:
+        """POST credentials to known Chiyu login forms."""
+        form_variants = [
+            {'Username': self.username, 'Password': self.password},
+            {'username': self.username, 'password': self.password},
+            {'UserName': self.username, 'PassWord': self.password},
+            {'userid': self.username, 'userpwd': self.password},
+            {'user': self.username, 'pwd': self.password},
+            {'login_user': self.username, 'login_pwd': self.password},
+            {'ID': self.username, 'PWD': self.password},
+        ]
+        for path in self._LOGIN_PATHS:
+            for fields in form_variants:
+                try:
+                    url = self.base_url + path
+                    resp = self.session.post(url, data=fields, timeout=self.timeout,
+                                             allow_redirects=True)
+                    body = (resp.text or '').lower()
+                    # Success heuristics: landed on a menu page, not a login form.
+                    if resp.status_code == 200 and (
+                        'access log' in body
+                        or 'terminal status' in body
+                        or 'main functions' in body
+                        or 'log out' in body
+                        or 'logout' in body
+                        or 'first in last out' in body
+                    ):
+                        logger.info("BIOSENSE login OK via POST %s fields=%s",
+                                    path, list(fields.keys()))
+                        return True
+                    # Some firmwares accept GET with query params.
+                    resp = self.session.get(url, params=fields, timeout=self.timeout)
+                    body = (resp.text or '').lower()
+                    if resp.status_code == 200 and (
+                        'access log' in body or 'terminal status' in body
+                        or 'log out' in body or 'logout' in body
+                    ):
+                        logger.info("BIOSENSE login OK via GET %s", path)
+                        return True
+                except Exception as e:
+                    logger.debug("BIOSENSE login attempt %s failed: %s", path, e)
+
+        # Some older firmwares have no auth or session cookie from the probe
+        # alone is enough — try fetching a protected page.
+        for path in self._LOG_PATHS:
+            try:
+                resp = self.session.get(self.base_url + path, timeout=self.timeout)
+                if resp.status_code == 200 and self._looks_like_access_log(resp.text):
+                    logger.info(
+                        "BIOSENSE Access Log reachable without form login (%s)",
+                        path,
+                    )
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _looks_like_access_log(html: str) -> bool:
+        if not html:
+            return False
+        low = html.lower()
+        return (
+            ('user id' in low or 'userid' in low or 'user_id' in low)
+            and ('in/out' in low or '>in<' in low or '>out<' in low
+                 or 'in out' in low)
+        ) or ('access log' in low and '<table' in low)
+
+    def get_attendance_logs(self, since: Optional[datetime] = None) -> List[Dict]:
+        """Fetch Access Log rows and map them to our outbound log dicts."""
+        html = self._fetch_access_log_html()
+        if not html:
+            logger.error("BIOSENSE: could not retrieve Access Log HTML")
+            return []
+
+        rows = self._parse_access_log_html(html)
+        if not rows:
+            # Try TXT export fallbacks.
+            txt = self._fetch_access_log_txt()
+            if txt:
+                rows = self._parse_access_log_txt(txt)
+
+        logs = []
+        skipped = 0
+        for row in rows:
+            ts = row.get('timestamp')
+            pin = row.get('pin')
+            if not pin or not ts:
+                skipped += 1
+                continue
+            if since and ts < since:
+                skipped += 1
+                continue
+            direction = (row.get('direction') or 'IN').upper()
+            punch = '0' if direction.startswith('IN') else '1'
+            auth = 'fingerprint'
+            note = (row.get('note') or '').lower()
+            if 'card' in note or 'rfid' in note or 'wiegand' in note:
+                auth = 'rfid'
+            elif 'password' in note or 'pin' in note:
+                auth = 'password'
+            logs.append({
+                'pin': str(pin).strip(),
+                'timestamp': to_utc_iso(ts, self.tz_name),
+                'punch': punch,
+                'auth_type': auth,
+                'verify_mode': '1' if auth == 'fingerprint' else '3',
+                'raw_punch': punch,
+                'raw_status': direction,
+            })
+
+        logger.info(
+            "BIOSENSE retrieved %s logs (%s skipped/filtered) from %s",
+            len(logs), skipped, self.host,
+        )
+        return logs
+
+    def _fetch_access_log_html(self) -> Optional[str]:
+        for path in self._LOG_PATHS:
+            try:
+                resp = self.session.get(self.base_url + path, timeout=self.timeout)
+                if resp.status_code == 200 and (
+                    self._looks_like_access_log(resp.text)
+                    or '<table' in (resp.text or '').lower()
+                ):
+                    logger.info("BIOSENSE Access Log page: %s", path)
+                    return resp.text
+            except Exception as e:
+                logger.debug("BIOSENSE log path %s failed: %s", path, e)
+
+        # Search the home / menu page for an Access Log link.
+        try:
+            home = self.session.get(self.base_url + '/', timeout=self.timeout)
+            hrefs = re.findall(
+                r'href=["\']([^"\']*(?:[Aa]ccess|[Ll]og)[^"\']*)["\']',
+                home.text or '',
+            )
+            for href in hrefs:
+                if href.startswith('http'):
+                    url = href
+                elif href.startswith('/'):
+                    url = self.base_url + href
+                else:
+                    url = self.base_url + '/' + href
+                resp = self.session.get(url, timeout=self.timeout)
+                if resp.status_code == 200 and self._looks_like_access_log(resp.text):
+                    logger.info("BIOSENSE Access Log via menu link: %s", href)
+                    return resp.text
+        except Exception as e:
+            logger.debug("BIOSENSE menu crawl failed: %s", e)
+        return None
+
+    def _fetch_access_log_txt(self) -> Optional[str]:
+        """Try common Export-TXT endpoints used by Chiyu firmwares."""
+        candidates = [
+            ('/AccessLog.htm', {'Export': 'TXT', 'Type': 'User', 'Selection': 'All'}),
+            ('/AccessLog.htm', {'export': 'txt', 'type': 'user', 'selection': 'all'}),
+            ('/AccLog.htm', {'Export': 'TXT'}),
+            ('/cgi-bin/AccessLog', {'format': 'txt'}),
+        ]
+        for path, data in candidates:
+            try:
+                resp = self.session.post(
+                    self.base_url + path, data=data, timeout=self.timeout,
+                )
+                text = resp.text or ''
+                if resp.status_code == 200 and text and (
+                    '\t' in text or 'User ID' in text or 'IN' in text
+                ):
+                    logger.info("BIOSENSE Access Log TXT export via %s", path)
+                    return text
+            except Exception:
+                continue
+        return None
+
+    def _parse_access_log_html(self, html: str) -> List[Dict]:
+        """Extract rows from HTML tables (User ID / Date / Time / IN|OUT)."""
+        rows: List[Dict] = []
+        # Split into <tr>…</tr> blocks (case-insensitive).
+        tr_blocks = re.findall(
+            r'<tr[^>]*>(.*?)</tr>', html, flags=re.IGNORECASE | re.DOTALL,
+        )
+        for block in tr_blocks:
+            cells = re.findall(
+                r'<t[dh][^>]*>(.*?)</t[dh]>', block,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            texts = [self._strip_html(c) for c in cells]
+            texts = [t.strip() for t in texts if t is not None]
+            if len(texts) < 4:
+                continue
+            # Skip header rows.
+            joined = ' '.join(texts).lower()
+            if 'user id' in joined or 'user name' in joined and 'date' in joined:
+                if any(h in joined for h in ('user id', 'userid', 'in/out')):
+                    continue
+
+            parsed = self._row_from_cells(texts)
+            if parsed:
+                rows.append(parsed)
+        return rows
+
+    def _parse_access_log_txt(self, text: str) -> List[Dict]:
+        rows: List[Dict] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.lower().startswith('user'):
+                continue
+            parts = re.split(r'[\t,;|]+', line)
+            parts = [p.strip() for p in parts if p.strip()]
+            if len(parts) < 4:
+                continue
+            parsed = self._row_from_cells(parts)
+            if parsed:
+                rows.append(parsed)
+        return rows
+
+    def _row_from_cells(self, texts: List[str]) -> Optional[Dict]:
+        """Heuristically map a list of cell strings to pin/timestamp/direction."""
+        direction = None
+        for t in texts:
+            up = t.upper().strip()
+            if up in ('IN', 'OUT') or up.startswith('IN ') or up.startswith('OUT '):
+                direction = 'IN' if up.startswith('IN') else 'OUT'
+                break
+        if not direction:
+            return None
+
+        # Date + time: look for recognizable patterns.
+        date_str = None
+        time_str = None
+        for t in texts:
+            if re.match(r'^\d{1,4}[/\-.]\d{1,2}[/\-.]\d{1,4}$', t):
+                date_str = t
+            elif re.match(r'^\d{1,2}:\d{2}(:\d{2})?$', t):
+                time_str = t
+        if not date_str or not time_str:
+            # Combined datetime in one cell.
+            for t in texts:
+                m = re.match(
+                    r'^(\d{1,4}[/\-.]\d{1,2}[/\-.]\d{1,4})\s+(\d{1,2}:\d{2}(?::\d{2})?)$',
+                    t,
+                )
+                if m:
+                    date_str, time_str = m.group(1), m.group(2)
+                    break
+        if not date_str or not time_str:
+            return None
+
+        ts = self._parse_device_datetime(date_str, time_str)
+        if not ts:
+            return None
+
+        # PIN / User ID: prefer "176(1)" style (id + level), then other IDs.
+        # Never take the leading serial "No." column alone when a better ID exists.
+        pin = None
+        candidates = []
+        for idx, t in enumerate(texts):
+            if t.upper().startswith(('IN', 'OUT')):
+                continue
+            if t == date_str or t == time_str:
+                continue
+            if re.match(r'^\d{1,4}[/\-.]\d{1,2}[/\-.]\d{1,4}$', t):
+                continue
+            if re.match(r'^\d{1,2}:\d{2}', t):
+                continue
+            m = re.match(r'^(\d+)\s*\(\d+\)$', t)  # 176(1)
+            if m:
+                candidates.append((0, m.group(1)))  # highest priority
+                continue
+            m = re.match(r'^(\d{2,})$', t)  # prefer multi-digit IDs over serial "1"
+            if m:
+                candidates.append((1, m.group(1)))
+                continue
+            if re.match(r'^[A-Za-z0-9_-]{1,16}$', t) and not t.isalpha():
+                candidates.append((2, t))
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            pin = candidates[0][1]
+        if not pin:
+            return None
+
+        note_parts = []
+        for t in texts:
+            if t in (pin, date_str, time_str):
+                continue
+            if t.upper().startswith(('IN', 'OUT')):
+                continue
+            if re.match(r'^\d+$', t):  # serial No. / door no.
+                continue
+            if re.match(r'^\d+\s*\(\d+\)$', t):  # user id with level
+                continue
+            note_parts.append(t)
+        note = ' '.join(note_parts)
+
+        return {
+            'pin': pin,
+            'timestamp': ts,
+            'direction': direction,
+            'note': note,
+        }
+
+    @staticmethod
+    def _parse_device_datetime(date_str: str, time_str: str) -> Optional[datetime]:
+        if len(time_str.split(':')) == 2:
+            time_str = time_str + ':00'
+        combos = [
+            '%m/%d/%Y %H:%M:%S',
+            '%d/%m/%Y %H:%M:%S',
+            '%Y/%m/%d %H:%M:%S',
+            '%Y-%m-%d %H:%M:%S',
+            '%m-%d-%Y %H:%M:%S',
+            '%d-%m-%Y %H:%M:%S',
+            '%m/%d/%y %H:%M:%S',
+            '%d/%m/%y %H:%M:%S',
+        ]
+        raw = '%s %s' % (date_str, time_str)
+        for fmt in combos:
+            try:
+                return datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _strip_html(fragment: str) -> str:
+        text = re.sub(r'<[^>]+>', ' ', fragment or '')
+        text = re.sub(r'&nbsp;|&#160;', ' ', text, flags=re.IGNORECASE)
+        text = re.sub(r'&amp;', '&', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+
+
 class BiometricDevice:
     """Wrapper for biometric device communication"""
     
@@ -512,11 +920,8 @@ class BiometricDevice:
 
         if self.device_type == 'biosense_t':
             logger.error(
-                "BIOSENSE-T at %s did not respond on ports %s. "
-                "Port 2000 is usually the ADMS server port, not the ZK SDK port. "
-                "If polling fails, configure the device for ADMS push to Odoo "
-                "(/iclock/cdata) and set connection_mode=adms on the device record.",
-                self.host, ports_to_try,
+                "Device type biosense_t must use BiosenseWebClient (HTTP), "
+                "not pyzk. Check sync_device routing."
             )
         return False
     
@@ -769,16 +1174,38 @@ def push_logs(odoo, logs: List[Dict], sync_config: Dict,
 def sync_device(dev_conf: Dict, odoo, sync_config: Dict) -> bool:
     """Pull attendance from a single device and push it to Odoo."""
     name = dev_conf.get('name') or dev_conf.get('device_code') or dev_conf.get('host')
-    logger.info("=== Syncing device: %s (%s:%s) ===",
-                name, dev_conf.get('host'), dev_conf.get('port'))
+    device_type = (dev_conf.get('device_type') or dev_conf.get('type') or 'auto').lower()
+    logger.info("=== Syncing device: %s (%s:%s, type=%s) ===",
+                name, dev_conf.get('host'), dev_conf.get('port'), device_type)
 
-    device = BiometricDevice(
-        host=dev_conf['host'],
-        port=int(dev_conf.get('port') or 4370),
-        password=int(dev_conf.get('password') or 0),
-        device_type=dev_conf.get('device_type') or dev_conf.get('type') or 'auto',
-        tz_name=dev_conf.get('timezone') or dev_conf.get('device_tz') or 'UTC',
-    )
+    # BIOSENSE-T / Chiyu: pull Access Logs over HTTP web UI (not pyzk).
+    if device_type in ('biosense_t', 'biosense', 'chiyu'):
+        web_port = int(dev_conf.get('port') or 80)
+        # Guard against stale Odoo config still set to SoMac (2000) or ZK (4370).
+        if web_port in (2000, 4370):
+            logger.warning(
+                "BIOSENSE %s has device_port=%s in Odoo — that is the SoMac/ZK "
+                "port, not the web UI. Using HTTP port 80 instead. Update "
+                "device_port to 80 on the device form.",
+                name, web_port,
+            )
+            web_port = 80
+        device = BiosenseWebClient(
+            host=dev_conf['host'],
+            port=web_port,
+            username=dev_conf.get('web_username') or 'admin',
+            password=dev_conf.get('web_password') or 'admin',
+            tz_name=dev_conf.get('timezone') or dev_conf.get('device_tz') or 'UTC',
+        )
+    else:
+        device = BiometricDevice(
+            host=dev_conf['host'],
+            port=int(dev_conf.get('port') or 4370),
+            password=int(dev_conf.get('password') or 0),
+            device_type=device_type,
+            tz_name=dev_conf.get('timezone') or dev_conf.get('device_tz') or 'UTC',
+        )
+
     if not device.connect():
         return False
 
@@ -797,8 +1224,12 @@ def sync_device(dev_conf: Dict, odoo, sync_config: Dict) -> bool:
         logger.info("Device %s: %s sent, %s failed", name, sent, failed)
 
         if sync_config.get('clear_after_sync', False) and failed == 0:
-            logger.info("Clearing device attendance records for %s...", name)
-            device.clear_attendance()
+            clear_fn = getattr(device, 'clear_attendance', None)
+            if clear_fn:
+                logger.info("Clearing device attendance records for %s...", name)
+                clear_fn()
+            else:
+                logger.info("Clear-after-sync skipped for %s (not supported)", name)
         return failed == 0
     finally:
         device.disconnect()

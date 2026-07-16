@@ -29,7 +29,12 @@ deployments where the server cannot reach the devices directly.
 | Device | Model | IP : Port | Serial | Timezone |
 |--------|-------|-----------|--------|----------|
 | Main Gate | iWEB / ZKTeco **F18** | `192.168.2.12 : 4370` | `BAY5235001172` | `Asia/Riyadh` |
-| Back Door | **BIOSENSE-T(EM)** | `192.168.2.49 : 4370` | `044ff5` (MAC `00:0e:e3:04:4f:f5`) | `Asia/Riyadh` |
+| Back Door | **BIOSENSE-T(EM)** | `192.168.2.49 : 80` (HTTP web UI) | `044ff5` (MAC `00:0e:e3:04:4f:f5`) | `Asia/Riyadh` |
+
+> **BIOSENSE note:** Port `2000` on the Terminal Status screen is the SoMac
+> *software* listen port (device → SoMac). This bridge does **not** use it.
+> It polls the device's built-in web UI on port **80** (login `admin`/`admin`
+> by default) and reads **Access Log** (IN → Check In, OUT → Check Out).
 
 > Both devices already exist in Odoo under **Attendances → Biometric → Devices**
 > after the module is installed. You only need to add **Employee Mappings**
@@ -167,6 +172,31 @@ file =                               ; installer auto-fills this with the log pa
 
 ## 5. Step-by-step verification & rollout
 
+### BIOSENSE-T setup (required once)
+
+On the device web UI (`http://192.168.2.49/`):
+
+1. Confirm **Web Management Port = 80** (Terminal Status).
+2. Leave **Software IP = 0.0.0.0** — SoMac push is not used by this bridge.
+3. Login defaults are usually `admin` / `admin` (change if the site uses other credentials).
+
+In Odoo → **Biometric → Devices → Back Door - BIOSENSE-T**:
+
+| Field | Value |
+|-------|-------|
+| Device Type | BIOSENSE-T |
+| Device IP | `192.168.2.49` |
+| Device Port | **`80`** (not 2000, not 4370) |
+| Web Username | `admin` |
+| Web Password | `admin` (or your real password) |
+| State | Active |
+
+From the bridge host, verify reachability:
+
+```bash
+curl -sI http://192.168.2.49/ | head -5
+```
+
 ### Step 1 — Sandbox validation (once mode)
 
 Run a single cycle with verbose logging to watch the live device handshakes,
@@ -181,7 +211,7 @@ A healthy run shows:
 - `Using Odoo 19 JSON-2 transport (/json/2)` then `JSON-2 API reachable`
 - `Auto-discovering devices from Odoo...` → `Discovered 2 device(s) to sync (parallel)`
 - Interleaved `=== Syncing device: Main Gate - iWEB F18 (192.168.2.12:4370) ===`
-  and `=== Syncing device: Back Door - BIOSENSE-T (192.168.2.49:4370) ===`
+  and `=== Syncing device: Back Door - BIOSENSE-T (192.168.2.49:80, type=biosense_t) ===`
 - `Retrieved N logs` and `Device ...: N sent, 0 failed` per device
 
 If one device is unplugged you'll see `Failed to connect to ...` for **that
