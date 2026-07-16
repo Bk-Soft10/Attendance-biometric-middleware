@@ -51,7 +51,7 @@ except ImportError:  # pragma: no cover
 # Optional: pyzk for direct ZKTeco communication
 try:
     from zk import ZK
-    from zk.const import ATTENDANCE_STATUS
+    # from zk.const import ATTENDANCE_STATUS
     PYZK_AVAILABLE = True
 except ImportError:
     PYZK_AVAILABLE = False
