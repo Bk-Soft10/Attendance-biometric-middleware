@@ -455,6 +455,17 @@ class BiosenseWebClient:
         '/AccessLog.htm', '/accesslog.htm', '/AccLog.htm', '/acclog.htm',
         '/log.htm', '/Log.htm', '/AccessLog.html', '/cgi-bin/AccessLog',
     )
+    _USER_LIST_PATHS = (
+        '/Users.htm', '/users.htm', '/UserList.htm', '/userlist.htm',
+        '/User.htm', '/user.htm',
+    )
+    # Chiyu firmware search/export form variants (AccLog / AccessLog pages).
+    _LOG_SEARCH_POSTS = (
+        {'Type': 'User', 'Sel': 'All', 'Search': 'Search'},
+        {'Category': 'User', 'Selection': 'All', 'Search': 'Search'},
+        {'type': 'user', 'sel': 'all', 'search': 'Search'},
+        {'Export': 'TXT', 'Type': 'User', 'Selection': 'All'},
+    )
 
     def __init__(self, host: str, port: int = 80, username: str = 'admin',
                  password: str = 'admin', timeout: int = 15,
@@ -472,6 +483,8 @@ class BiosenseWebClient:
             'Accept': 'text/html,application/xhtml+xml,*/*',
         })
         self._logged_in = False
+        # name (lower) → User ID, filled from the device Users page when needed.
+        self._users_by_name: Dict[str, str] = {}
 
     def connect(self) -> bool:
         """Reach the device web UI and authenticate."""
@@ -668,6 +681,8 @@ class BiosenseWebClient:
 
     def get_attendance_logs(self, since: Optional[datetime] = None) -> List[Dict]:
         """Fetch Access Log rows and map them to our outbound log dicts."""
+        self._load_user_directory()
+
         html = self._fetch_access_log_html()
         if not html:
             logger.error("BIOSENSE: could not retrieve Access Log HTML")
@@ -675,10 +690,12 @@ class BiosenseWebClient:
 
         rows = self._parse_access_log_html(html)
         if not rows:
-            # Try TXT export fallbacks.
             txt = self._fetch_access_log_txt()
             if txt:
                 rows = self._parse_access_log_txt(txt)
+
+        if not rows and html:
+            self._log_unparsed_sample(html, source='HTML')
 
         logs = []
         skipped = 0
@@ -715,7 +732,104 @@ class BiosenseWebClient:
         )
         return logs
 
+    def _load_user_directory(self) -> None:
+        """Build User Name → User ID map from the device Users page."""
+        if self._users_by_name:
+            return
+        for path in self._USER_LIST_PATHS:
+            try:
+                resp = self.session.get(self.base_url + path, timeout=self.timeout)
+                if resp.status_code != 200 or not resp.text:
+                    continue
+                cols: Optional[Dict[str, int]] = None
+                for block in re.findall(
+                    r'<tr[^>]*>(.*?)</tr>', resp.text,
+                    flags=re.IGNORECASE | re.DOTALL,
+                ):
+                    cells = self._cells_from_tr_block(block)
+                    texts = [c['text'] for c in cells]
+                    if len(texts) < 2:
+                        continue
+                    header = self._header_map(texts)
+                    if header:
+                        cols = header
+                        continue
+                    if not cols:
+                        continue
+                    uid = self._pin_from_cells(cells, cols, roles=('user_id', 'card', 'employee_id'))
+                    name = self._cell_text(cells, cols, 'name')
+                    if uid and name and not self._is_placeholder(name):
+                        self._users_by_name[name.strip().lower()] = uid
+                if self._users_by_name:
+                    logger.info(
+                        "BIOSENSE loaded %s user name(s) from %s",
+                        len(self._users_by_name), path,
+                    )
+                    return
+            except Exception as e:
+                logger.debug("BIOSENSE user list %s failed: %s", path, e)
+
+    def _log_unparsed_sample(self, content: str, source: str = 'HTML') -> None:
+        """Emit raw table rows when parsing produced nothing — aids field tuning."""
+        if source.upper() == 'HTML':
+            blocks = re.findall(
+                r'<tr[^>]*>(.*?)</tr>', content, flags=re.IGNORECASE | re.DOTALL,
+            )
+            samples = []
+            for block in blocks[:15]:
+                cells = self._cells_from_tr_block(block)
+                texts = [c['text'] for c in cells]
+                if len(texts) >= 3:
+                    samples.append(texts)
+            if samples:
+                logger.warning(
+                    "BIOSENSE parsed 0 rows from %s — sample table rows: %s",
+                    source, samples[:5],
+                )
+        else:
+            lines = [ln.strip() for ln in content.splitlines() if ln.strip()][:8]
+            if lines:
+                logger.warning(
+                    "BIOSENSE parsed 0 rows from %s — sample lines: %s",
+                    source, lines,
+                )
+
     def _fetch_access_log_html(self) -> Optional[str]:
+        for path in self._LOG_PATHS:
+            try:
+                resp = self.session.get(self.base_url + path, timeout=self.timeout)
+                if resp.status_code == 200 and (
+                    self._looks_like_access_log(resp.text)
+                    or '<table' in (resp.text or '').lower()
+                ):
+                    rows = self._parse_access_log_html(resp.text or '')
+                    if rows:
+                        logger.info("BIOSENSE Access Log page: %s (%s rows)", path, len(rows))
+                        return resp.text
+                    logger.debug("BIOSENSE %s returned a table but 0 parsed rows", path)
+            except Exception as e:
+                logger.debug("BIOSENSE log path %s failed: %s", path, e)
+
+        # Some firmwares only populate the log table after a Search POST.
+        for path in self._LOG_PATHS:
+            for fields in self._LOG_SEARCH_POSTS:
+                try:
+                    resp = self.session.post(
+                        self.base_url + path, data=fields, timeout=self.timeout,
+                    )
+                    if resp.status_code != 200 or not resp.text:
+                        continue
+                    rows = self._parse_access_log_html(resp.text)
+                    if rows:
+                        logger.info(
+                            "BIOSENSE Access Log via POST %s fields=%s (%s rows)",
+                            path, sorted(fields.keys()), len(rows),
+                        )
+                        return resp.text
+                except Exception as e:
+                    logger.debug("BIOSENSE POST %s failed: %s", path, e)
+
+        # Return the first HTML page even when empty — TXT export / diagnostics.
         for path in self._LOG_PATHS:
             try:
                 resp = self.session.get(self.base_url + path, timeout=self.timeout)
@@ -725,8 +839,8 @@ class BiosenseWebClient:
                 ):
                     logger.info("BIOSENSE Access Log page: %s", path)
                     return resp.text
-            except Exception as e:
-                logger.debug("BIOSENSE log path %s failed: %s", path, e)
+            except Exception:
+                continue
 
         # Crawl the UI: the home page is usually a frameset shell, so follow
         # frames first, then any Access-Log-looking link inside them.
@@ -800,13 +914,20 @@ class BiosenseWebClient:
     # Header keywords → logical column, ordered by preference within a role.
     _HEADER_ROLES = (
         ('user_id', ('user id', 'userid', 'user_id', 'user no', 'id no',
-                     'employee', 'emp id', 'staff')),
+                     'staff', 'enroll')),
+        ('employee_id', ('employee id', 'employee no', 'emp no', 'empid')),
         ('card', ('card no', 'card number', 'cardno', 'card', 'badge')),
         ('name', ('user name', 'username', 'name')),
         ('date', ('date',)),
         ('time', ('time',)),
         ('direction', ('in/out', 'in out', 'inout', 'direction', 'status')),
         ('note', ('note', 'remark', 'mode', 'verify', 'method', 'door', 'reader')),
+    )
+    _HREF_ID_PATTERNS = (
+        r'(?:UserID|userid|UserId|EnrollID|enroll)=["\']?(\d+)',
+        r'(?:\?|&)(?:ID|Id|id)=["\']?(\d+)',
+        r'UserRecord[^"\']*(?:ID|id)=["\']?(\d+)',
+        r'ModifyUser[^"\']*(?:ID|id)=["\']?(\d+)',
     )
 
     @classmethod
@@ -829,21 +950,85 @@ class BiosenseWebClient:
                     break
         # A real header identifies at least a time-ish column plus an identity
         # column; otherwise it is a data row that happens to contain words.
-        has_identity = 'user_id' in mapping or 'card' in mapping
+        has_identity = (
+            'user_id' in mapping or 'card' in mapping or 'employee_id' in mapping
+        )
         has_time = 'date' in mapping or 'time' in mapping
         return mapping if has_identity and has_time else None
 
-    def _row_from_header(self, texts: List[str], cols: Dict[str, int]) -> Optional[Dict]:
-        """Build a log row using column positions discovered in the header."""
-        def cell(role: str) -> str:
-            idx = cols.get(role)
-            if idx is None or idx >= len(texts):
-                return ''
-            return texts[idx].strip()
+    @classmethod
+    def _href_pin(cls, cell_html: str) -> Optional[str]:
+        for pat in cls._HREF_ID_PATTERNS:
+            m = re.search(pat, cell_html or '', flags=re.IGNORECASE)
+            if m:
+                return m.group(1)
+        return None
 
-        date_str, time_str = cell('date'), cell('time')
+    @classmethod
+    def _cells_from_tr_block(cls, block: str) -> List[Dict]:
+        """Parse one table row into [{text, href_pin}, …]."""
+        cells = re.findall(
+            r'<t[dh][^>]*>(.*?)</t[dh]>', block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        out = []
+        for raw in cells:
+            text = cls._strip_html(raw)
+            out.append({
+                'text': text.strip() if text is not None else '',
+                'href_pin': cls._href_pin(raw),
+            })
+        return out
+
+    @classmethod
+    def _normalize_pin_value(cls, value: str) -> Optional[str]:
+        if not value or cls._is_placeholder(value):
+            return None
+        m = re.match(r'^(\d+)\s*\(\d+\)$', value.strip())  # 176(1)
+        if m:
+            return m.group(1)
+        m = re.match(r'^(\d{2,})$', value.strip())
+        if m:
+            return m.group(1)
+        if re.match(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,15}$', value.strip()):
+            return value.strip()
+        return None
+
+    @classmethod
+    def _cell_text(cls, cells: List[Dict], cols: Dict[str, int], role: str) -> str:
+        idx = cols.get(role)
+        if idx is None or idx >= len(cells):
+            return ''
+        return cells[idx]['text']
+
+    def _pin_from_cells(self, cells: List[Dict], cols: Dict[str, int],
+                        roles: tuple = ('user_id', 'card', 'employee_id', 'name')) -> Optional[str]:
+        """Resolve the best biometric pin from mapped columns."""
+        for role in roles:
+            idx = cols.get(role)
+            if idx is None or idx >= len(cells):
+                continue
+            cell = cells[idx]
+            if cell.get('href_pin'):
+                return cell['href_pin']
+            pin = self._normalize_pin_value(cell.get('text') or '')
+            if pin:
+                return pin
+
+        name = self._cell_text(cells, cols, 'name')
+        if name and not self._is_placeholder(name):
+            mapped = self._users_by_name.get(name.strip().lower())
+            if mapped:
+                return mapped
+            # Last resort: send the display name so Odoo can map by name.
+            return name.strip()
+        return None
+
+    def _row_from_header(self, cells: List[Dict], cols: Dict[str, int]) -> Optional[Dict]:
+        """Build a log row using column positions discovered in the header."""
+        date_str = self._cell_text(cells, cols, 'date')
+        time_str = self._cell_text(cells, cols, 'time')
         if date_str and not time_str:
-            # Some firmwares put "MM/DD/YYYY HH:MM:SS" in a single Date column.
             m = re.match(r'^(\S+)\s+(\d{1,2}:\d{2}(?::\d{2})?)$', date_str)
             if m:
                 date_str, time_str = m.group(1), m.group(2)
@@ -851,25 +1036,21 @@ class BiosenseWebClient:
         if not ts:
             return None
 
-        # Identity: User ID first, then Card No, then Name — skipping "----".
-        pin = ''
-        for role in ('user_id', 'card', 'name'):
-            value = cell(role)
-            if value and not self._is_placeholder(value):
-                m = re.match(r'^(\w+)\s*\(\d+\)$', value)  # "176(1)" → 176
-                pin = m.group(1) if m else value
-                break
+        pin = self._pin_from_cells(cells, cols)
         if not pin:
             logger.warning(
-                "BIOSENSE: skipping log row with no usable user id: %s", texts)
+                "BIOSENSE: skipping log row with no usable user id: %s",
+                [c['text'] for c in cells],
+            )
             return None
 
-        raw_dir = cell('direction').upper()
+        raw_dir = self._cell_text(cells, cols, 'direction').upper()
         direction = 'OUT' if raw_dir.startswith('OUT') else 'IN'
 
-        note = cell('note')
-        if not note and 'name' in cols and pin != cell('name'):
-            note = cell('name')
+        note = self._cell_text(cells, cols, 'note')
+        name = self._cell_text(cells, cols, 'name')
+        if not note and name and name != pin:
+            note = name
 
         return {
             'pin': pin,
@@ -879,24 +1060,15 @@ class BiosenseWebClient:
         }
 
     def _parse_access_log_html(self, html: str) -> List[Dict]:
-        """Extract rows from HTML tables (User ID / Date / Time / IN|OUT).
-
-        Prefers the table header to locate columns, because the heuristic
-        fallback can otherwise latch onto a placeholder cell such as "----".
-        """
+        """Extract rows from HTML tables (User ID / Date / Time / IN|OUT)."""
         rows: List[Dict] = []
         cols: Optional[Dict[str, int]] = None
-        # Split into <tr>…</tr> blocks (case-insensitive).
         tr_blocks = re.findall(
             r'<tr[^>]*>(.*?)</tr>', html, flags=re.IGNORECASE | re.DOTALL,
         )
         for block in tr_blocks:
-            cells = re.findall(
-                r'<t[dh][^>]*>(.*?)</t[dh]>', block,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            texts = [self._strip_html(c) for c in cells]
-            texts = [t.strip() for t in texts if t is not None]
+            cells = self._cells_from_tr_block(block)
+            texts = [c['text'] for c in cells]
             if len(texts) < 3:
                 continue
 
@@ -906,7 +1078,7 @@ class BiosenseWebClient:
                 logger.debug("BIOSENSE Access Log columns: %s", cols)
                 continue
 
-            parsed = (self._row_from_header(texts, cols) if cols
+            parsed = (self._row_from_header(cells, cols) if cols
                       else self._row_from_cells(texts))
             if parsed:
                 rows.append(parsed)
@@ -914,17 +1086,30 @@ class BiosenseWebClient:
 
     def _parse_access_log_txt(self, text: str) -> List[Dict]:
         rows: List[Dict] = []
+        cols: Optional[Dict[str, int]] = None
         for line in text.splitlines():
             line = line.strip()
-            if not line or line.lower().startswith('user'):
+            if not line:
                 continue
-            parts = re.split(r'[\t,;|]+', line)
+            parts = re.split(r'\t+', line)
+            if len(parts) < 4:
+                parts = re.split(r'[,;|]+', line)
             parts = [p.strip() for p in parts if p.strip()]
             if len(parts) < 4:
                 continue
-            parsed = self._row_from_cells(parts)
+            header = self._header_map(parts)
+            if header:
+                cols = header
+                continue
+            if cols:
+                pseudo = [{'text': p, 'href_pin': None} for p in parts]
+                parsed = self._row_from_header(pseudo, cols)
+            else:
+                parsed = self._row_from_cells(parts)
             if parsed:
                 rows.append(parsed)
+        if not rows:
+            self._log_unparsed_sample(text, source='TXT')
         return rows
 
     def _row_from_cells(self, texts: List[str]) -> Optional[Dict]:
@@ -994,6 +1179,30 @@ class BiosenseWebClient:
         if candidates:
             candidates.sort(key=lambda x: x[0])
             pin = candidates[0][1]
+        if not pin:
+            # Heuristic path: try User Name / free-text identity columns.
+            for t in texts:
+                if self._is_placeholder(t):
+                    continue
+                if t.upper().startswith(('IN', 'OUT')):
+                    continue
+                if t == date_str or t == time_str:
+                    continue
+                if re.match(r'^\d{1,4}[/\-.]\d{1,2}[/\-.]\d{1,4}$', t):
+                    continue
+                if re.match(r'^\d{1,2}:\d{2}', t):
+                    continue
+                if re.match(r'^\d+$', t):
+                    continue
+                mapped = self._users_by_name.get(t.strip().lower())
+                if mapped:
+                    pin = mapped
+                    break
+                if len(t.strip()) >= 2 and not t.strip().lower().startswith(
+                    ('finger', 'card', 'pass', 'accepted', 'reject'),
+                ):
+                    pin = t.strip()
+                    break
         if not pin:
             return None
 

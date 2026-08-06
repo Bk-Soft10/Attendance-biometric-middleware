@@ -267,6 +267,34 @@ class TestBiosenseWebParsing(unittest.TestCase):
         self.assertEqual(rows[1]['pin'], '176')
         self.assertEqual(rows[1]['direction'], 'IN')
 
+    def test_user_id_from_href_when_display_is_placeholder(self):
+        html = """
+        <table>
+          <tr><th>No.</th><th>User ID</th><th>User Name</th><th>Date</th>
+              <th>Time</th><th>IN/OUT</th></tr>
+          <tr><td>1</td><td><a href="UserRecord.htm?UserID=176">----</a></td>
+              <td>Ali</td><td>08/06/2026</td><td>12:10:42</td><td>OUT</td></tr>
+        </table>
+        """
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        rows = client._parse_access_log_html(html)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['pin'], '176')
+
+    def test_name_used_when_user_id_and_card_are_placeholders(self):
+        html = """
+        <table>
+          <tr><th>No.</th><th>Card No.</th><th>User ID</th><th>User Name</th>
+              <th>Date</th><th>Time</th><th>IN/OUT</th></tr>
+          <tr><td>1</td><td>----</td><td>----</td><td>Sabik</td>
+              <td>08/06/2026</td><td>12:10:42</td><td>OUT</td></tr>
+        </table>
+        """
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        rows = client._parse_access_log_html(html)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['pin'], 'Sabik')
+
     def test_row_without_any_identity_is_skipped(self):
         html = """
         <table>
