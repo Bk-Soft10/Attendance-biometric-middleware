@@ -281,7 +281,60 @@ class TestBiosenseWebParsing(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['pin'], '176')
 
+    def test_aclog_firmware_parses_139N_and_in_zero(self):
+        """Real BIOSENSE-T AccLog.htm rows from field probe output."""
+        html = """
+        <table>
+          <tr><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+          <tr><td>1 .</td><td>----</td><td>----</td><td>08/06/2026</td><td>17:06:27</td>
+              <td>OUT</td><td>NONE</td><td>1</td><td>None EXIT BUTTON</td></tr>
+          <tr><td>4 .</td><td>139(N)</td><td>ahmed halawa</td><td>08/06/2026</td><td>17:03:03</td>
+              <td>IN(0)</td><td>NONE</td><td>1</td><td>F</td></tr>
+          <tr><td>5 .</td><td>126(N)</td><td>Umer Farooq</td><td>08/06/2026</td><td>17:02:08</td>
+              <td>IN(0)</td><td>NONE</td><td>1</td><td>F</td></tr>
+          <tr><td>7 .</td><td>193(N)</td><td>Ishag</td><td>08/06/2026</td><td>16:47:09</td>
+              <td>IN(0)</td><td>NONE</td><td>1</td><td>F</td></tr>
+        </table>
+        """
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        rows = client._parse_access_log_html(html)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]['pin'], '139')
+        self.assertEqual(rows[0]['direction'], 'IN')
+        self.assertEqual(rows[1]['pin'], '126')
+        self.assertEqual(rows[2]['pin'], '193')
+
+    def test_exit_button_rows_are_skipped(self):
+        html = """
+        <table>
+          <tr><td>1 .</td><td>----</td><td>----</td><td>08/06/2026</td><td>17:06:27</td>
+              <td>OUT</td><td>NONE</td><td>1</td><td>None EXIT BUTTON</td></tr>
+          <tr><td>4 .</td><td>139(N)</td><td>ahmed halawa</td><td>08/06/2026</td><td>17:03:03</td>
+              <td>IN(0)</td><td>NONE</td><td>1</td><td>F</td></tr>
+        </table>
+        """
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        rows = client._parse_access_log_html(html)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['pin'], '139')
+
+    def test_parse_direction_handles_in_zero(self):
+        self.assertEqual(bm.BiosenseWebClient._parse_direction('IN(0)'), 'IN')
+        self.assertEqual(bm.BiosenseWebClient._parse_direction('OUT'), 'OUT')
+
     def test_name_used_when_user_id_and_card_are_placeholders(self):
+        html = """
+        <table>
+          <tr><th>No.</th><th>Card No.</th><th>User ID</th><th>User Name</th>
+              <th>Date</th><th>Time</th><th>IN/OUT</th></tr>
+          <tr><td>1</td><td>----</td><td>----</td><td>Sabik</td>
+              <td>08/06/2026</td><td>12:10:42</td><td>OUT</td></tr>
+        </table>
+        """
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        rows = client._parse_access_log_html(html)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['pin'], 'Sabik')
         html = """
         <table>
           <tr><th>No.</th><th>Card No.</th><th>User ID</th><th>User Name</th>

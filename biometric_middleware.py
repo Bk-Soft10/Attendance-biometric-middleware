@@ -923,6 +923,16 @@ class BiosenseWebClient:
         ('direction', ('in/out', 'in out', 'inout', 'direction', 'status')),
         ('note', ('note', 'remark', 'mode', 'verify', 'method', 'door', 'reader')),
     )
+    # AccLog.htm on BIOSENSE-T / WebPass (firmware 1.00.x): labels come from JS
+    # e_text[] — there is no <th> header row in the HTML table itself.
+    _ACCLOG_FIXED_COLS = {
+        'user_id': 1, 'name': 2, 'date': 3, 'time': 4,
+        'direction': 5, 'note': 8,
+    }
+    _NON_ATTENDANCE_NOTE_MARKERS = (
+        'exit button', 'fire alarm', 'duress', 'reject', 'rejected', 'door held',
+    )
+
     _HREF_ID_PATTERNS = (
         r'(?:UserID|userid|UserId|EnrollID|enroll)=["\']?(\d+)',
         r'(?:\?|&)(?:ID|Id|id)=["\']?(\d+)',
@@ -933,6 +943,39 @@ class BiosenseWebClient:
     @classmethod
     def _is_placeholder(cls, value: Optional[str]) -> bool:
         return (value or '').strip().lower() in cls._PLACEHOLDERS
+
+    @classmethod
+    def _parse_direction(cls, raw: str) -> Optional[str]:
+        """Map device strings such as IN, IN(0), OUT, OUT(1) → IN / OUT."""
+        up = (raw or '').upper().strip()
+        if up.startswith('OUT'):
+            return 'OUT'
+        if up.startswith('IN'):
+            return 'IN'
+        return None
+
+    @classmethod
+    def _aclog_fixed_cols(cls, texts: List[str]) -> Optional[Dict[str, int]]:
+        """Detect the fixed 9-column AccLog.htm layout from a data row."""
+        if len(texts) < 9:
+            return None
+        if not re.match(r'^\d{1,4}[/\-.]\d{1,2}[/\-.]\d{1,4}$', texts[3]):
+            return None
+        if not re.match(r'^\d{1,2}:\d{2}', texts[4]):
+            return None
+        if cls._parse_direction(texts[5]) is None:
+            return None
+        return dict(cls._ACCLOG_FIXED_COLS)
+
+    def _is_non_attendance_row(self, cells: List[Dict],
+                               cols: Dict[str, int]) -> bool:
+        """Skip door events (Exit Button, etc.) that are not employee punches."""
+        uid = self._cell_text(cells, cols, 'user_id')
+        name = self._cell_text(cells, cols, 'name')
+        note = self._cell_text(cells, cols, 'note').lower()
+        if not (self._is_placeholder(uid) and self._is_placeholder(name)):
+            return False
+        return any(marker in note for marker in self._NON_ATTENDANCE_NOTE_MARKERS)
 
     @classmethod
     def _header_map(cls, texts: List[str]) -> Optional[Dict[str, int]]:
@@ -984,10 +1027,11 @@ class BiosenseWebClient:
     def _normalize_pin_value(cls, value: str) -> Optional[str]:
         if not value or cls._is_placeholder(value):
             return None
-        m = re.match(r'^(\d+)\s*\(\d+\)$', value.strip())  # 176(1)
+        # Chiyu formats: 139(N) normal user, 176(1) level 1, plain 176
+        m = re.match(r'^(\d+)\s*\([^)]+\)$', value.strip())
         if m:
             return m.group(1)
-        m = re.match(r'^(\d{2,})$', value.strip())
+        m = re.match(r'^(\d{1,})$', value.strip())
         if m:
             return m.group(1)
         if re.match(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,15}$', value.strip()):
@@ -1038,14 +1082,16 @@ class BiosenseWebClient:
 
         pin = self._pin_from_cells(cells, cols)
         if not pin:
-            logger.warning(
+            logger.debug(
                 "BIOSENSE: skipping log row with no usable user id: %s",
                 [c['text'] for c in cells],
             )
             return None
 
-        raw_dir = self._cell_text(cells, cols, 'direction').upper()
-        direction = 'OUT' if raw_dir.startswith('OUT') else 'IN'
+        raw_dir = self._cell_text(cells, cols, 'direction')
+        direction = self._parse_direction(raw_dir)
+        if not direction:
+            return None
 
         note = self._cell_text(cells, cols, 'note')
         name = self._cell_text(cells, cols, 'name')
@@ -1078,7 +1124,16 @@ class BiosenseWebClient:
                 logger.debug("BIOSENSE Access Log columns: %s", cols)
                 continue
 
-            parsed = (self._row_from_header(cells, cols) if cols
+            row_cols = cols
+            if not row_cols:
+                row_cols = self._aclog_fixed_cols(texts)
+                if row_cols and not cols:
+                    logger.debug("BIOSENSE using fixed AccLog.htm column layout")
+
+            if row_cols and self._is_non_attendance_row(cells, row_cols):
+                continue
+
+            parsed = (self._row_from_header(cells, row_cols) if row_cols
                       else self._row_from_cells(texts))
             if parsed:
                 rows.append(parsed)
@@ -1116,9 +1171,8 @@ class BiosenseWebClient:
         """Heuristically map a list of cell strings to pin/timestamp/direction."""
         direction = None
         for t in texts:
-            up = t.upper().strip()
-            if up in ('IN', 'OUT') or up.startswith('IN ') or up.startswith('OUT '):
-                direction = 'IN' if up.startswith('IN') else 'OUT'
+            direction = self._parse_direction(t)
+            if direction:
                 break
         if not direction:
             return None
@@ -1163,16 +1217,17 @@ class BiosenseWebClient:
                 continue
             if re.match(r'^\d{1,2}:\d{2}', t):
                 continue
-            m = re.match(r'^(\d+)\s*\(\d+\)$', t)  # 176(1)
+            m = re.match(r'^(\d+)\s*\([^)]+\)$', t)  # 139(N), 176(1)
             if m:
                 candidates.append((0, m.group(1)))  # highest priority
                 continue
-            m = re.match(r'^(\d{2,})$', t)  # prefer multi-digit IDs over serial "1"
+            m = re.match(r'^(\d{2,})$', t)  # multi-digit IDs only (skip door "1")
             if m:
                 candidates.append((1, m.group(1)))
                 continue
-            # Alphanumeric IDs such as "A123". Bare single digits are excluded
-            # on purpose: they are the row's serial "No.", not a user id.
+            if re.match(r'^\d+$', t):  # serial No. / door index — never a user id
+                continue
+            # Alphanumeric IDs such as "A123".
             if (re.match(r'^[A-Za-z0-9_-]{1,16}$', t) and not t.isalpha()
                     and re.search(r'[A-Za-z]', t) and re.search(r'\d', t)):
                 candidates.append((2, t))
