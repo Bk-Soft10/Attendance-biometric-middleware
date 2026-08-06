@@ -247,6 +247,57 @@ class TestBiosenseWebParsing(unittest.TestCase):
         # 08:20 Riyadh = 05:20 UTC
         self.assertTrue(logs[0]['timestamp'].startswith('2026-07-16T05:20:00'))
 
+    def test_header_maps_columns_and_ignores_placeholder_user_id(self):
+        """A '----' User ID must fall back to the Card column, not become the pin."""
+        html = """
+        <table>
+          <tr><th>No.</th><th>Card No.</th><th>User ID</th><th>User Name</th>
+              <th>Date</th><th>Time</th><th>IN/OUT</th><th>Note</th></tr>
+          <tr><td>1</td><td>0001234567</td><td>----</td><td>Ali</td>
+              <td>08/06/2026</td><td>12:10:42</td><td>OUT</td><td>Finger</td></tr>
+          <tr><td>2</td><td>0009999999</td><td>176</td><td>Omar</td>
+              <td>08/06/2026</td><td>08:01:00</td><td>IN</td><td>Card</td></tr>
+        </table>
+        """
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        rows = client._parse_access_log_html(html)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]['pin'], '0001234567')
+        self.assertEqual(rows[0]['direction'], 'OUT')
+        self.assertEqual(rows[1]['pin'], '176')
+        self.assertEqual(rows[1]['direction'], 'IN')
+
+    def test_row_without_any_identity_is_skipped(self):
+        html = """
+        <table>
+          <tr><th>No.</th><th>Card No.</th><th>User ID</th><th>Date</th>
+              <th>Time</th><th>IN/OUT</th></tr>
+          <tr><td>1</td><td>----</td><td>----</td><td>08/06/2026</td>
+              <td>12:10:42</td><td>OUT</td></tr>
+        </table>
+        """
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        self.assertEqual(client._parse_access_log_html(html), [])
+
+    def test_heuristic_fallback_never_returns_placeholder_pin(self):
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        row = client._row_from_cells(
+            ['1', '----', '08/06/2026', '12:10:42', 'OUT', 'Finger'])
+        self.assertIsNone(row)
+
+    def test_single_date_column_with_embedded_time(self):
+        html = """
+        <table>
+          <tr><th>User ID</th><th>Date</th><th>IN/OUT</th></tr>
+          <tr><td>176</td><td>08/06/2026 12:10:42</td><td>IN</td></tr>
+        </table>
+        """
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        rows = client._parse_access_log_html(html)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['pin'], '176')
+        self.assertEqual(rows[0]['timestamp'].hour, 12)
+
     def test_login_uses_http_basic_auth(self):
         """Device answering 401 must be retried with HTTP Basic credentials."""
         client = bm.BiosenseWebClient('192.168.2.49', username='user',

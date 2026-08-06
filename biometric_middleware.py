@@ -793,9 +793,99 @@ class BiosenseWebClient:
                 continue
         return None
 
+    # Cells the device uses to mean "no value here".
+    _PLACEHOLDERS = ('', '-', '--', '---', '----', '-----', 'n/a', 'na', 'null',
+                     'none', '0000000000', 'xxxx')
+
+    # Header keywords → logical column, ordered by preference within a role.
+    _HEADER_ROLES = (
+        ('user_id', ('user id', 'userid', 'user_id', 'user no', 'id no',
+                     'employee', 'emp id', 'staff')),
+        ('card', ('card no', 'card number', 'cardno', 'card', 'badge')),
+        ('name', ('user name', 'username', 'name')),
+        ('date', ('date',)),
+        ('time', ('time',)),
+        ('direction', ('in/out', 'in out', 'inout', 'direction', 'status')),
+        ('note', ('note', 'remark', 'mode', 'verify', 'method', 'door', 'reader')),
+    )
+
+    @classmethod
+    def _is_placeholder(cls, value: Optional[str]) -> bool:
+        return (value or '').strip().lower() in cls._PLACEHOLDERS
+
+    @classmethod
+    def _header_map(cls, texts: List[str]) -> Optional[Dict[str, int]]:
+        """Map column index → role when `texts` looks like a header row."""
+        mapping: Dict[str, int] = {}
+        for idx, cell in enumerate(texts):
+            low = cell.strip().lower()
+            if not low:
+                continue
+            for role, keywords in cls._HEADER_ROLES:
+                if role in mapping:
+                    continue
+                if any(low == kw or kw in low for kw in keywords):
+                    mapping[role] = idx
+                    break
+        # A real header identifies at least a time-ish column plus an identity
+        # column; otherwise it is a data row that happens to contain words.
+        has_identity = 'user_id' in mapping or 'card' in mapping
+        has_time = 'date' in mapping or 'time' in mapping
+        return mapping if has_identity and has_time else None
+
+    def _row_from_header(self, texts: List[str], cols: Dict[str, int]) -> Optional[Dict]:
+        """Build a log row using column positions discovered in the header."""
+        def cell(role: str) -> str:
+            idx = cols.get(role)
+            if idx is None or idx >= len(texts):
+                return ''
+            return texts[idx].strip()
+
+        date_str, time_str = cell('date'), cell('time')
+        if date_str and not time_str:
+            # Some firmwares put "MM/DD/YYYY HH:MM:SS" in a single Date column.
+            m = re.match(r'^(\S+)\s+(\d{1,2}:\d{2}(?::\d{2})?)$', date_str)
+            if m:
+                date_str, time_str = m.group(1), m.group(2)
+        ts = self._parse_device_datetime(date_str, time_str) if date_str and time_str else None
+        if not ts:
+            return None
+
+        # Identity: User ID first, then Card No, then Name — skipping "----".
+        pin = ''
+        for role in ('user_id', 'card', 'name'):
+            value = cell(role)
+            if value and not self._is_placeholder(value):
+                m = re.match(r'^(\w+)\s*\(\d+\)$', value)  # "176(1)" → 176
+                pin = m.group(1) if m else value
+                break
+        if not pin:
+            logger.warning(
+                "BIOSENSE: skipping log row with no usable user id: %s", texts)
+            return None
+
+        raw_dir = cell('direction').upper()
+        direction = 'OUT' if raw_dir.startswith('OUT') else 'IN'
+
+        note = cell('note')
+        if not note and 'name' in cols and pin != cell('name'):
+            note = cell('name')
+
+        return {
+            'pin': pin,
+            'timestamp': ts,
+            'direction': direction,
+            'note': note,
+        }
+
     def _parse_access_log_html(self, html: str) -> List[Dict]:
-        """Extract rows from HTML tables (User ID / Date / Time / IN|OUT)."""
+        """Extract rows from HTML tables (User ID / Date / Time / IN|OUT).
+
+        Prefers the table header to locate columns, because the heuristic
+        fallback can otherwise latch onto a placeholder cell such as "----".
+        """
         rows: List[Dict] = []
+        cols: Optional[Dict[str, int]] = None
         # Split into <tr>…</tr> blocks (case-insensitive).
         tr_blocks = re.findall(
             r'<tr[^>]*>(.*?)</tr>', html, flags=re.IGNORECASE | re.DOTALL,
@@ -807,15 +897,17 @@ class BiosenseWebClient:
             )
             texts = [self._strip_html(c) for c in cells]
             texts = [t.strip() for t in texts if t is not None]
-            if len(texts) < 4:
+            if len(texts) < 3:
                 continue
-            # Skip header rows.
-            joined = ' '.join(texts).lower()
-            if 'user id' in joined or 'user name' in joined and 'date' in joined:
-                if any(h in joined for h in ('user id', 'userid', 'in/out')):
-                    continue
 
-            parsed = self._row_from_cells(texts)
+            header = self._header_map(texts)
+            if header:
+                cols = header
+                logger.debug("BIOSENSE Access Log columns: %s", cols)
+                continue
+
+            parsed = (self._row_from_header(texts, cols) if cols
+                      else self._row_from_cells(texts))
             if parsed:
                 rows.append(parsed)
         return rows
@@ -880,6 +972,8 @@ class BiosenseWebClient:
                 continue
             if t == date_str or t == time_str:
                 continue
+            if self._is_placeholder(t):
+                continue
             if re.match(r'^\d{1,4}[/\-.]\d{1,2}[/\-.]\d{1,4}$', t):
                 continue
             if re.match(r'^\d{1,2}:\d{2}', t):
@@ -892,7 +986,10 @@ class BiosenseWebClient:
             if m:
                 candidates.append((1, m.group(1)))
                 continue
-            if re.match(r'^[A-Za-z0-9_-]{1,16}$', t) and not t.isalpha():
+            # Alphanumeric IDs such as "A123". Bare single digits are excluded
+            # on purpose: they are the row's serial "No.", not a user id.
+            if (re.match(r'^[A-Za-z0-9_-]{1,16}$', t) and not t.isalpha()
+                    and re.search(r'[A-Za-z]', t) and re.search(r'\d', t)):
                 candidates.append((2, t))
         if candidates:
             candidates.sort(key=lambda x: x[0])
@@ -1513,8 +1610,17 @@ def probe_biosense(host: str, username: str = 'admin', password: str = 'admin',
     client = BiosenseWebClient(host, port=port, username=username,
                                password=password, timeout=timeout)
     if client.connect():
+        raw = client._fetch_access_log_html()
+        if raw:
+            print('\n  Access Log table rows as the device sends them:')
+            for block in re.findall(r'<tr[^>]*>(.*?)</tr>', raw,
+                                    flags=re.IGNORECASE | re.DOTALL)[:12]:
+                cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', block,
+                                   flags=re.IGNORECASE | re.DOTALL)
+                print('   %s' % [BiosenseWebClient._strip_html(c).strip()
+                                 for c in cells])
         logs = client.get_attendance_logs(since=None)
-        print('  connect() OK — retrieved %s log(s)' % len(logs))
+        print('\n  connect() OK — retrieved %s log(s)' % len(logs))
         for entry in logs[:5]:
             print('   %s' % entry)
     else:
