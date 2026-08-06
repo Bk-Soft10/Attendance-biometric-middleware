@@ -476,11 +476,14 @@ class BiosenseWebClient:
     def connect(self) -> bool:
         """Reach the device web UI and authenticate."""
         try:
-            # Probe reachability first.
+            # Probe reachability first. Chiyu firmwares answer a bare GET / with
+            # either 200 (no auth / form login) or 401 + WWW-Authenticate.
             probe = self.session.get(self.base_url + '/', timeout=self.timeout)
+            challenge = probe.headers.get('WWW-Authenticate', '')
             logger.info(
-                "BIOSENSE web UI reachable at %s (HTTP %s)",
+                "BIOSENSE web UI reachable at %s (HTTP %s%s)",
                 self.base_url, probe.status_code,
+                ', auth: %s' % challenge if challenge else '',
             )
         except Exception as e:
             logger.error(
@@ -490,15 +493,17 @@ class BiosenseWebClient:
             )
             return False
 
-        if self._try_login():
+        if self._try_login(probe):
             self._logged_in = True
             return True
 
         logger.error(
             "BIOSENSE login failed at %s with user '%s'. "
-            "Verify web_username / web_password on the device record "
-            "(device defaults are usually admin/admin).",
-            self.base_url, self.username,
+            "Check web_username / web_password on the device record. "
+            "Chiyu defaults: admin/admin (administrator), user/user (operator), "
+            "user0/user0 (user). Run with --probe-biosense %s to dump the raw "
+            "HTTP handshake for diagnosis.",
+            self.base_url, self.username, self.host,
         )
         return False
 
@@ -509,8 +514,67 @@ class BiosenseWebClient:
         except Exception:
             pass
 
-    def _try_login(self) -> bool:
-        """POST credentials to known Chiyu login forms."""
+    def _try_login(self, probe=None) -> bool:
+        """Authenticate: HTTP Basic/Digest first, then HTML form variants.
+
+        Chiyu built-in HTTP servers normally protect the UI with HTTP Basic
+        auth (the browser's native popup), so that is tried before any form.
+        """
+        if self._try_http_auth(probe):
+            return True
+        if self._try_form_login():
+            return True
+
+        # Some older firmwares expose the log pages without authentication.
+        for path in self._LOG_PATHS:
+            try:
+                resp = self.session.get(self.base_url + path, timeout=self.timeout)
+                if resp.status_code == 200 and self._looks_like_access_log(resp.text):
+                    logger.info(
+                        "BIOSENSE Access Log reachable without login (%s)", path,
+                    )
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _try_http_auth(self, probe=None) -> bool:
+        """Try HTTP Basic then Digest credentials against the device."""
+        from requests.auth import HTTPBasicAuth, HTTPDigestAuth
+
+        challenge = ''
+        if probe is not None:
+            challenge = (probe.headers.get('WWW-Authenticate') or '').lower()
+
+        schemes = []
+        if 'digest' in challenge:
+            schemes = [('digest', HTTPDigestAuth), ('basic', HTTPBasicAuth)]
+        else:
+            schemes = [('basic', HTTPBasicAuth), ('digest', HTTPDigestAuth)]
+
+        for scheme_name, auth_cls in schemes:
+            auth = auth_cls(self.username, self.password)
+            for path in ('/',) + self._LOG_PATHS:
+                try:
+                    resp = self.session.get(
+                        self.base_url + path, auth=auth, timeout=self.timeout,
+                    )
+                except Exception as e:
+                    logger.debug("BIOSENSE %s auth on %s failed: %s",
+                                 scheme_name, path, e)
+                    continue
+                if resp.status_code == 401:
+                    continue
+                if resp.status_code == 200 and self._looks_authenticated(resp.text):
+                    # Keep the credentials on the session for later requests.
+                    self.session.auth = auth
+                    logger.info("BIOSENSE login OK via HTTP %s auth (%s)",
+                                scheme_name, path)
+                    return True
+        return False
+
+    def _try_form_login(self) -> bool:
+        """POST credentials to known Chiyu HTML login forms."""
         form_variants = [
             {'Username': self.username, 'Password': self.password},
             {'username': self.username, 'password': self.password},
@@ -521,50 +585,35 @@ class BiosenseWebClient:
             {'ID': self.username, 'PWD': self.password},
         ]
         for path in self._LOGIN_PATHS:
+            url = self.base_url + path
             for fields in form_variants:
                 try:
-                    url = self.base_url + path
                     resp = self.session.post(url, data=fields, timeout=self.timeout,
                                              allow_redirects=True)
-                    body = (resp.text or '').lower()
-                    # Success heuristics: landed on a menu page, not a login form.
-                    if resp.status_code == 200 and (
-                        'access log' in body
-                        or 'terminal status' in body
-                        or 'main functions' in body
-                        or 'log out' in body
-                        or 'logout' in body
-                        or 'first in last out' in body
-                    ):
+                    if resp.status_code == 200 and self._looks_authenticated(resp.text):
                         logger.info("BIOSENSE login OK via POST %s fields=%s",
                                     path, list(fields.keys()))
                         return True
-                    # Some firmwares accept GET with query params.
                     resp = self.session.get(url, params=fields, timeout=self.timeout)
-                    body = (resp.text or '').lower()
-                    if resp.status_code == 200 and (
-                        'access log' in body or 'terminal status' in body
-                        or 'log out' in body or 'logout' in body
-                    ):
+                    if resp.status_code == 200 and self._looks_authenticated(resp.text):
                         logger.info("BIOSENSE login OK via GET %s", path)
                         return True
                 except Exception as e:
-                    logger.debug("BIOSENSE login attempt %s failed: %s", path, e)
-
-        # Some older firmwares have no auth or session cookie from the probe
-        # alone is enough — try fetching a protected page.
-        for path in self._LOG_PATHS:
-            try:
-                resp = self.session.get(self.base_url + path, timeout=self.timeout)
-                if resp.status_code == 200 and self._looks_like_access_log(resp.text):
-                    logger.info(
-                        "BIOSENSE Access Log reachable without form login (%s)",
-                        path,
-                    )
-                    return True
-            except Exception:
-                continue
+                    logger.debug("BIOSENSE form login %s failed: %s", path, e)
         return False
+
+    @staticmethod
+    def _looks_authenticated(html: str) -> bool:
+        """True when the response looks like an authenticated menu/log page."""
+        if not html:
+            return False
+        low = html.lower()
+        if 'unauthorized' in low or 'password error' in low:
+            return False
+        return any(marker in low for marker in (
+            'access log', 'terminal status', 'main functions', 'first in last out',
+            'log out', 'logout', 'remote control', 'auto-refresh log',
+        ))
 
     @staticmethod
     def _looks_like_access_log(html: str) -> bool:
@@ -1301,6 +1350,100 @@ def run_daemon(odoo, config: Dict):
         time.sleep(interval)
 
 
+def probe_biosense(host: str, username: str = 'admin', password: str = 'admin',
+                   port: int = 80, timeout: int = 15):
+    """Dump the BIOSENSE web handshake so login problems can be diagnosed.
+
+    Prints, for each candidate URL: HTTP status, auth challenge, page title and
+    a short body snippet — enough to tell whether the device wants Basic auth,
+    a form login, or uses different page names than we expect.
+    """
+    from requests.auth import HTTPBasicAuth, HTTPDigestAuth
+
+    base = 'http://%s:%s' % (host, port)
+    print('=' * 70)
+    print('BIOSENSE probe: %s (user=%r)' % (base, username))
+    print('=' * 70)
+
+    def describe(resp):
+        title = ''
+        m = re.search(r'<title[^>]*>(.*?)</title>', resp.text or '',
+                      flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            title = BiosenseWebClient._strip_html(m.group(1))[:80]
+        challenge = resp.headers.get('WWW-Authenticate', '')
+        print('    status=%s len=%s%s' % (
+            resp.status_code, len(resp.content or b''),
+            ' auth=%r' % challenge if challenge else ''))
+        if title:
+            print('    title=%r' % title)
+        snippet = BiosenseWebClient._strip_html(resp.text or '')[:300]
+        if snippet:
+            print('    body=%r' % snippet)
+
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'BiometricBridge/1.0 (probe)'})
+
+    print('\n[1] Anonymous GET /')
+    try:
+        resp = session.get(base + '/', timeout=timeout)
+        describe(resp)
+    except Exception as e:
+        print('    ERROR: %s' % e)
+        print('\nDevice unreachable — check LAN/firewall and Web Management Port.')
+        return
+
+    for scheme_name, auth_cls in (('Basic', HTTPBasicAuth), ('Digest', HTTPDigestAuth)):
+        print('\n[2] HTTP %s auth GET /' % scheme_name)
+        try:
+            resp = session.get(base + '/', auth=auth_cls(username, password),
+                               timeout=timeout)
+            describe(resp)
+        except Exception as e:
+            print('    ERROR: %s' % e)
+
+    print('\n[3] Candidate Access Log pages (with Basic auth)')
+    auth = HTTPBasicAuth(username, password)
+    for path in BiosenseWebClient._LOG_PATHS:
+        try:
+            resp = session.get(base + path, auth=auth, timeout=timeout)
+            print('  %s' % path)
+            describe(resp)
+        except Exception as e:
+            print('  %s -> ERROR: %s' % (path, e))
+
+    print('\n[4] Links found on the home page')
+    try:
+        home = session.get(base + '/', auth=auth, timeout=timeout)
+        links = re.findall(r'(?:href|src|action)=["\']([^"\']+)["\']', home.text or '')
+        for link in sorted(set(links))[:40]:
+            print('  %s' % link)
+        forms = re.findall(r'<form[^>]*>', home.text or '', flags=re.IGNORECASE)
+        if forms:
+            print('\n  Forms:')
+            for f in forms[:10]:
+                print('   %s' % f[:200])
+        inputs = re.findall(r'<input[^>]*>', home.text or '', flags=re.IGNORECASE)
+        if inputs:
+            print('\n  Inputs:')
+            for i in inputs[:20]:
+                print('   %s' % i[:200])
+    except Exception as e:
+        print('  ERROR: %s' % e)
+
+    print('\n[5] Full client attempt')
+    client = BiosenseWebClient(host, port=port, username=username,
+                               password=password, timeout=timeout)
+    if client.connect():
+        logs = client.get_attendance_logs(since=None)
+        print('  connect() OK — retrieved %s log(s)' % len(logs))
+        for entry in logs[:5]:
+            print('   %s' % entry)
+    else:
+        print('  connect() FAILED — send this whole output for tuning.')
+    client.disconnect()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Biometric Middleware for Odoo Hybrid Integration',
@@ -1323,6 +1466,12 @@ Examples:
     
     parser.add_argument('--config', '-c', help='Configuration file path')
     parser.add_argument('--create-config', help='Create sample configuration file', metavar='PATH')
+    parser.add_argument('--probe-biosense', metavar='HOST',
+                        help='Diagnose a BIOSENSE/Chiyu device web UI and exit')
+    parser.add_argument('--web-user', default='admin',
+                        help='Web username for --probe-biosense (default: admin)')
+    parser.add_argument('--web-password', default='admin',
+                        help='Web password for --probe-biosense (default: admin)')
     parser.add_argument('--host', help='Device IP address')
     parser.add_argument('--port', type=int, default=4370, help='Device port (default: 4370)')
     parser.add_argument('--url', help='Odoo URL')
@@ -1347,6 +1496,12 @@ Examples:
     # Create sample config
     if args.create_config:
         create_sample_config(args.create_config)
+        return
+
+    # BIOSENSE diagnostics
+    if args.probe_biosense:
+        logger.setLevel(logging.DEBUG)
+        probe_biosense(args.probe_biosense, args.web_user, args.web_password)
         return
     
     # Load configuration

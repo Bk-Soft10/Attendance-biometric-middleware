@@ -247,6 +247,48 @@ class TestBiosenseWebParsing(unittest.TestCase):
         # 08:20 Riyadh = 05:20 UTC
         self.assertTrue(logs[0]['timestamp'].startswith('2026-07-16T05:20:00'))
 
+    def test_login_uses_http_basic_auth(self):
+        """Device answering 401 must be retried with HTTP Basic credentials."""
+        client = bm.BiosenseWebClient('192.168.2.49', username='user',
+                                      password='secret')
+
+        def fake_get(url, **kwargs):
+            resp = mock.Mock()
+            if kwargs.get('auth') is None:
+                resp.status_code = 401
+                resp.headers = {'WWW-Authenticate': 'Basic realm="BIOSENSE"'}
+                resp.text = 'Unauthorized'
+                resp.content = b''
+                return resp
+            resp.status_code = 200
+            resp.headers = {}
+            resp.text = '<html><body>Access Log</body></html>'
+            resp.content = resp.text.encode()
+            return resp
+
+        client.session = mock.Mock()
+        client.session.get.side_effect = fake_get
+        self.assertTrue(client.connect())
+        self.assertIsNotNone(client.session.auth)
+        self.assertEqual(client.session.auth.username, 'user')
+        self.assertEqual(client.session.auth.password, 'secret')
+
+    def test_login_fails_when_credentials_rejected(self):
+        client = bm.BiosenseWebClient('192.168.2.49', username='x', password='y')
+
+        def always_401(url, **kwargs):
+            resp = mock.Mock()
+            resp.status_code = 401
+            resp.headers = {'WWW-Authenticate': 'Basic realm="BIOSENSE"'}
+            resp.text = 'Unauthorized'
+            resp.content = b''
+            return resp
+
+        client.session = mock.Mock()
+        client.session.get.side_effect = always_401
+        client.session.post.side_effect = always_401
+        self.assertFalse(client.connect())
+
     def test_stale_port_redirect_in_sync(self):
         """device_port 2000/4370 must fall back to HTTP 80 for BIOSENSE."""
         odoo = mock.Mock()
