@@ -602,18 +602,58 @@ class BiosenseWebClient:
                     logger.debug("BIOSENSE form login %s failed: %s", path, e)
         return False
 
-    @staticmethod
-    def _looks_authenticated(html: str) -> bool:
-        """True when the response looks like an authenticated menu/log page."""
+    # Text that only appears when the device rejected the credentials.
+    _REJECTION_MARKERS = (
+        'unauthorized', 'password error', 'login failed', 'invalid password',
+        'wrong password', 'authentication failed', 'access denied',
+    )
+    # Text that only appears once we are inside the management UI.
+    _AUTH_MARKERS = (
+        'access log', 'terminal status', 'main functions', 'first in last out',
+        'log out', 'logout', 'remote control', 'auto-refresh log',
+        'user administration', 'system log', 'add new user',
+    )
+
+    @classmethod
+    def _looks_authenticated(cls, html: str) -> bool:
+        """True when the response looks like an authenticated page.
+
+        Chiyu web UIs are frameset-based: the top-level document is just a
+        ``<frameset>`` shell whose menu/content live in child frames, so it
+        contains none of the usual markers. Treat a frameset (or any page that
+        is clearly not a login form) as authenticated — the caller confirms by
+        actually fetching the Access Log.
+        """
         if not html:
             return False
         low = html.lower()
-        if 'unauthorized' in low or 'password error' in low:
+        if any(bad in low for bad in cls._REJECTION_MARKERS):
             return False
-        return any(marker in low for marker in (
-            'access log', 'terminal status', 'main functions', 'first in last out',
-            'log out', 'logout', 'remote control', 'auto-refresh log',
-        ))
+        if any(marker in low for marker in cls._AUTH_MARKERS):
+            return True
+        # Frameset shell: real content is in the child frames.
+        if '<frameset' in low or '<frame ' in low or '<iframe' in low:
+            return True
+        # A password field means we are still looking at the login form.
+        if 'type="password"' in low or "type='password'" in low:
+            return False
+        return False
+
+    def _frame_sources(self, html: str) -> List[str]:
+        """Return frame/iframe sources referenced by a frameset shell."""
+        if not html:
+            return []
+        return re.findall(
+            r'<(?:i?frame)[^>]+src=["\']([^"\']+)["\']',
+            html, flags=re.IGNORECASE,
+        )
+
+    def _absolute(self, href: str) -> str:
+        if href.startswith('http'):
+            return href
+        if href.startswith('/'):
+            return self.base_url + href
+        return self.base_url + '/' + href
 
     @staticmethod
     def _looks_like_access_log(html: str) -> bool:
@@ -688,24 +728,44 @@ class BiosenseWebClient:
             except Exception as e:
                 logger.debug("BIOSENSE log path %s failed: %s", path, e)
 
-        # Search the home / menu page for an Access Log link.
+        # Crawl the UI: the home page is usually a frameset shell, so follow
+        # frames first, then any Access-Log-looking link inside them.
         try:
             home = self.session.get(self.base_url + '/', timeout=self.timeout)
-            hrefs = re.findall(
-                r'href=["\']([^"\']*(?:[Aa]ccess|[Ll]og)[^"\']*)["\']',
-                home.text or '',
-            )
-            for href in hrefs:
-                if href.startswith('http'):
-                    url = href
-                elif href.startswith('/'):
-                    url = self.base_url + href
-                else:
-                    url = self.base_url + '/' + href
-                resp = self.session.get(url, timeout=self.timeout)
-                if resp.status_code == 200 and self._looks_like_access_log(resp.text):
-                    logger.info("BIOSENSE Access Log via menu link: %s", href)
-                    return resp.text
+            pages = [home.text or '']
+            for src in self._frame_sources(home.text or ''):
+                try:
+                    frame = self.session.get(self._absolute(src), timeout=self.timeout)
+                    logger.debug("BIOSENSE followed frame %s (HTTP %s)",
+                                 src, frame.status_code)
+                    if frame.status_code == 200:
+                        if self._looks_like_access_log(frame.text):
+                            logger.info("BIOSENSE Access Log inside frame: %s", src)
+                            return frame.text
+                        pages.append(frame.text or '')
+                except Exception as e:
+                    logger.debug("BIOSENSE frame %s failed: %s", src, e)
+
+            seen = set()
+            for page in pages:
+                hrefs = re.findall(
+                    r'(?:href|action)=["\']([^"\']*(?:access|log|acc)[^"\']*)["\']',
+                    page, flags=re.IGNORECASE,
+                )
+                for href in hrefs:
+                    if href.lower().startswith(('javascript:', 'mailto:', '#')):
+                        continue
+                    url = self._absolute(href)
+                    if url in seen:
+                        continue
+                    seen.add(url)
+                    try:
+                        resp = self.session.get(url, timeout=self.timeout)
+                    except Exception:
+                        continue
+                    if resp.status_code == 200 and self._looks_like_access_log(resp.text):
+                        logger.info("BIOSENSE Access Log via menu link: %s", href)
+                        return resp.text
         except Exception as e:
             logger.debug("BIOSENSE menu crawl failed: %s", e)
         return None
@@ -1418,6 +1478,24 @@ def probe_biosense(host: str, username: str = 'admin', password: str = 'admin',
         links = re.findall(r'(?:href|src|action)=["\']([^"\']+)["\']', home.text or '')
         for link in sorted(set(links))[:40]:
             print('  %s' % link)
+
+        frames = re.findall(r'<(?:i?frame)[^>]+src=["\']([^"\']+)["\']',
+                            home.text or '', flags=re.IGNORECASE)
+        if frames:
+            print('\n  Frames (following each):')
+            for src in frames:
+                url = src if src.startswith('http') else (
+                    base + src if src.startswith('/') else base + '/' + src)
+                print('   %s' % url)
+                try:
+                    fr = session.get(url, auth=auth, timeout=timeout)
+                    describe(fr)
+                    sub = re.findall(r'(?:href|action)=["\']([^"\']+)["\']',
+                                     fr.text or '')
+                    for link in sorted(set(sub))[:25]:
+                        print('      link: %s' % link)
+                except Exception as e:
+                    print('      ERROR: %s' % e)
         forms = re.findall(r'<form[^>]*>', home.text or '', flags=re.IGNORECASE)
         if forms:
             print('\n  Forms:')

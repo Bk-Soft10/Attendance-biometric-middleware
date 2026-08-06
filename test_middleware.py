@@ -273,6 +273,46 @@ class TestBiosenseWebParsing(unittest.TestCase):
         self.assertEqual(client.session.auth.username, 'user')
         self.assertEqual(client.session.auth.password, 'secret')
 
+    def test_frameset_shell_counts_as_authenticated(self):
+        """Chiyu UIs are frameset shells with none of the usual markers."""
+        shell = ('<html><frameset cols="180,*">'
+                 '<frame name="menu" src="menu.htm">'
+                 '<frame name="main" src="status.htm">'
+                 '</frameset></html>')
+        self.assertTrue(bm.BiosenseWebClient._looks_authenticated(shell))
+
+    def test_login_form_is_not_authenticated(self):
+        form = ('<html><body><form><input type="text" name="Username">'
+                '<input type="password" name="Password"></form></body></html>')
+        self.assertFalse(bm.BiosenseWebClient._looks_authenticated(form))
+
+    def test_rejection_page_is_not_authenticated(self):
+        self.assertFalse(
+            bm.BiosenseWebClient._looks_authenticated('<html>Unauthorized</html>'))
+
+    def test_access_log_found_inside_frame(self):
+        client = bm.BiosenseWebClient('192.168.2.49', tz_name='Asia/Riyadh')
+        shell = '<html><frameset><frame src="menu.htm"></frameset></html>'
+
+        def fake_get(url, **kwargs):
+            resp = mock.Mock()
+            resp.status_code = 200
+            resp.headers = {}
+            if url.endswith('menu.htm'):
+                resp.text = self.SAMPLE_HTML
+            elif url.endswith('/'):
+                resp.text = shell
+            else:
+                resp.text = '<html>nothing</html>'
+            resp.content = resp.text.encode()
+            return resp
+
+        client.session = mock.Mock()
+        client.session.get.side_effect = fake_get
+        html = client._fetch_access_log_html()
+        self.assertIsNotNone(html)
+        self.assertIn('Access Log', html)
+
     def test_login_fails_when_credentials_rejected(self):
         client = bm.BiosenseWebClient('192.168.2.49', username='x', password='y')
 
